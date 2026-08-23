@@ -228,8 +228,8 @@ create_or_edit_config() {
 
     read -r -p "本地每类保留几个备份 LOCAL_KEEP [${LOCAL_KEEP:-3}]: " input
     LOCAL_KEEP="${input:-${LOCAL_KEEP:-3}}"
-    read -r -p "远程每类保留几个备份 REMOTE_KEEP [${REMOTE_KEEP:-0，0=不清理远程}]: " input
-    REMOTE_KEEP="${input:-${REMOTE_KEEP:-0}}"
+    read -r -p "远程每类保留几个备份 REMOTE_KEEP [${REMOTE_KEEP:-3}，0=不清理远程]: " input
+    REMOTE_KEEP="${input:-${REMOTE_KEEP:-3}}"
     read -r -p "额外 ssh/scp 参数 SCP_EXTRA_OPTS（可留空，当前 ${SCP_EXTRA_OPTS:-无}）: " input
     SCP_EXTRA_OPTS="${input:-$SCP_EXTRA_OPTS}"
 
