@@ -186,8 +186,12 @@ check_openclaw_update() {
 		install_rc=$?
 		cat "$install_log"
 
-		# 如果服务不存在或 install 返回失败，尝试 --force 重装一次。
-		if [ "$install_rc" -ne 0 ] || ! systemctl --user status openclaw-gateway.service >/dev/null 2>&1; then
+		# openclaw gateway install 在服务已存在/已启用时可能返回非 0，
+		# 但这不是失败；只要 unit 已存在，就直接启动，不要误判后强制重装。
+		if systemctl --user cat openclaw-gateway.service >/dev/null 2>&1 || [ -f "$HOME/.config/systemd/user/openclaw-gateway.service" ]; then
+			echo "Gateway 服务已存在，跳过强制重装，直接启动。"
+			systemctl --user daemon-reload >/dev/null 2>&1 || true
+		elif [ "$install_rc" -ne 0 ]; then
 			echo "正在强制重装 OpenClaw Gateway 服务..."
 			timeout 90 openclaw gateway install --force || {
 				rm -f "$install_log"
@@ -5512,7 +5516,7 @@ openclaw_backup_restore_menu() {
 		fi
 
 		echo "即将备份 OpenClaw 自制全量数据：$data_dir"
-		echo "备份前会先停止 Gateway，等待缓存/数据库落库，备份完成后不会自动启动，请手动启动。"
+		echo "备份前会先停止 Gateway，等待缓存/数据库落库；如果备份前 Gateway 正在运行，备份完成后会自动重新启动。"
 		echo "注意：备份可能包含 API Key、机器人 Token、会话、记忆等敏感信息，请妥善保管。"
 		read -e -p "确认开始备份？(y/N): " confirm
 		if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
@@ -5532,10 +5536,18 @@ openclaw_backup_restore_menu() {
 			-C "$parent" "$base"
 		tar_status=$?
 
-		echo "备份流程已结束，OpenClaw Gateway 保持停止状态；如需运行请回主菜单手动启动。"
-
 		if [ "$tar_status" -eq 0 ]; then
 			echo "✅ 备份完成：$archive"
+			if [ "$was_running" -eq 1 ]; then
+				echo "备份前 Gateway 正在运行，正在自动重新启动 OpenClaw Gateway..."
+				if openclaw_custom_start_after_restore; then
+					echo "✅ OpenClaw Gateway 已重新启动。"
+				else
+					echo "⚠️ 备份已完成，但 Gateway 自动启动失败，请回主菜单用 2 号手动启动/查看日志。"
+				fi
+			else
+				echo "备份前 Gateway 未运行，备份完成后保持停止状态。"
+			fi
 		else
 			echo "❌ 备份失败。"
 			rm -f "$archive"
