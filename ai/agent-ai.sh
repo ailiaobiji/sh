@@ -17,6 +17,7 @@ OPENCLAW_SCRIPT='/root/Openclaw.sh'
 HERMES_BACKUP_DIR="${HOME}/hermes_memory_backups"
 OPENCLAW_BACKUP_DIR="${HOME}/openclaw_custom_backups"
 LOCAL_KEEP_DEFAULT=3
+REMOTE_KEEP_DEFAULT=3
 
 # 当前远程配置变量；由 load_target_config 加载
 PROFILE_NAME=''
@@ -25,7 +26,7 @@ REMOTE_USER=''
 REMOTE_HOST=''
 REMOTE_PORT='22'
 REMOTE_DIR='/root/agent-ai-backups'
-REMOTE_KEEP='0'
+REMOTE_KEEP="$REMOTE_KEEP_DEFAULT"
 AUTH_METHOD='key'   # key=密钥/默认SSH；password=密码(sshpass)
 SSH_KEY=''
 SSH_PASSWORD=''
@@ -109,7 +110,7 @@ load_target_config() {
     REMOTE_HOST=''
     REMOTE_PORT='22'
     REMOTE_DIR='/root/agent-ai-backups'
-    REMOTE_KEEP='0'
+    REMOTE_KEEP="$REMOTE_KEEP_DEFAULT"
     AUTH_METHOD='key'
     SSH_KEY=''
     SSH_PASSWORD=''
@@ -123,7 +124,7 @@ load_target_config() {
     ENABLED="${ENABLED:-1}"
     REMOTE_PORT="${REMOTE_PORT:-22}"
     REMOTE_DIR="${REMOTE_DIR:-/root/agent-ai-backups}"
-    REMOTE_KEEP="${REMOTE_KEEP:-0}"
+    REMOTE_KEEP="${REMOTE_KEEP:-$REMOTE_KEEP_DEFAULT}"
     AUTH_METHOD="${AUTH_METHOD:-key}"
     SSH_KEY="${SSH_KEY:-}"
     SSH_PASSWORD="${SSH_PASSWORD:-}"
@@ -173,8 +174,8 @@ create_or_edit_config() {
         REMOTE_HOST=''
         REMOTE_PORT='22'
         REMOTE_DIR='/root/agent-ai-backups'
-        LOCAL_KEEP='3'
-        REMOTE_KEEP='0'
+        LOCAL_KEEP="$LOCAL_KEEP_DEFAULT"
+        REMOTE_KEEP="$REMOTE_KEEP_DEFAULT"
         AUTH_METHOD='key'
         SSH_KEY=''
         SSH_PASSWORD=''
@@ -226,10 +227,10 @@ create_or_edit_config() {
             ;;
     esac
 
-    read -r -p "本地每类保留几个备份 LOCAL_KEEP [${LOCAL_KEEP:-3}]: " input
-    LOCAL_KEEP="${input:-${LOCAL_KEEP:-3}}"
-    read -r -p "远程每类保留几个备份 REMOTE_KEEP [${REMOTE_KEEP:-3}，0=不清理远程]: " input
-    REMOTE_KEEP="${input:-${REMOTE_KEEP:-3}}"
+    read -r -p "本地每类保留几个备份 LOCAL_KEEP [${LOCAL_KEEP:-$LOCAL_KEEP_DEFAULT}]: " input
+    LOCAL_KEEP="${input:-${LOCAL_KEEP:-$LOCAL_KEEP_DEFAULT}}"
+    read -r -p "远程每类保留几个备份 REMOTE_KEEP [${REMOTE_KEEP:-$REMOTE_KEEP_DEFAULT}，0=不清理远程]: " input
+    REMOTE_KEEP="${input:-${REMOTE_KEEP:-$REMOTE_KEEP_DEFAULT}}"
     read -r -p "额外 ssh/scp 参数 SCP_EXTRA_OPTS（可留空，当前 ${SCP_EXTRA_OPTS:-无}）: " input
     SCP_EXTRA_OPTS="${input:-$SCP_EXTRA_OPTS}"
 
