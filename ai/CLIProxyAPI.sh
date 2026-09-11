@@ -106,7 +106,7 @@ backup_app() {
         return
     fi
 
-    BACKUP_FILE="${BACKUP_DIR}/CPI-$(date +%Y%m%d%H%M%S).tar.gz"
+    BACKUP_FILE="${BACKUP_DIR}/CPA-$(date +%Y%m%d%H%M%S).tar.gz"
 
     echo "开始备份..."
     echo
@@ -124,14 +124,14 @@ restore_app() {
     echo "当前备份文件:"
     echo
 
-    ls -1t ${BACKUP_DIR}/CPI-*.tar.gz 2>/dev/null || true
+    ls -1t ${BACKUP_DIR}/CPA-*.tar.gz 2>/dev/null || true
 
     echo
 
     read -p "输入备份文件名（直接回车恢复最新）: " FILE
 
     if [ -z "$FILE" ]; then
-        FILE=$(ls -1t ${BACKUP_DIR}/CPI-*.tar.gz 2>/dev/null | head -n 1)
+        FILE=$(ls -1t ${BACKUP_DIR}/CPA-*.tar.gz 2>/dev/null | head -n 1)
     else
         FILE="${BACKUP_DIR}/${FILE}"
     fi
