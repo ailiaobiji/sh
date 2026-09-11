@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -e
+
 APP_NAME="CLIProxyAPI"
 APP_DIR="/home/docker/CLIProxyAPI"
 BACKUP_DIR="/home"
