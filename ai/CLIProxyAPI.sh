@@ -107,11 +107,36 @@ backup_app() {
     fi
 
     BACKUP_FILE="${BACKUP_DIR}/CPA-$(date +%Y%m%d%H%M%S).tar.gz"
+    WAS_RUNNING="no"
 
     echo "开始备份..."
+    echo "为保证文件一致性，将先停止容器再备份。"
     echo
 
+    if [ -f "$APP_DIR/docker-compose.yml" ]; then
+        if docker inspect -f '{{.State.Running}}' cli-proxy-api 2>/dev/null | grep -q true; then
+            WAS_RUNNING="yes"
+        fi
+
+        echo "停止容器..."
+        cd "$APP_DIR"
+        docker compose down || true
+        sleep 2
+    fi
+
     tar -czf "$BACKUP_FILE" -C /home/docker CLIProxyAPI
+    TAR_STATUS=$?
+
+    if [ "$WAS_RUNNING" = "yes" ] && [ -f "$APP_DIR/docker-compose.yml" ]; then
+        echo "启动容器..."
+        cd "$APP_DIR"
+        docker compose up -d
+    fi
+
+    if [ $TAR_STATUS -ne 0 ]; then
+        echo "备份失败"
+        return 1
+    fi
 
     echo "备份完成:"
     echo "$BACKUP_FILE"
