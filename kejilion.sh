@@ -1,5 +1,5 @@
 #!/bin/bash
-sh_v="0.0.2"
+sh_v="0.0.3"
 
 bai='\033[0m'
 hui='\e[37m'
@@ -12731,10 +12731,12 @@ while true; do
     echo -e "${gl_kjlan}1.   ${gl_bai}使用 Docker 安装到 /home/docker/fail2ban"
     echo -e "${gl_kjlan}2.   ${gl_bai}更新"
     echo -e "${gl_kjlan}3.   ${gl_bai}配置 SSH 防暴力破解"
-    echo -e "${gl_kjlan}4.   ${gl_bai}查看统计 TOP10"
-    echo -e "${gl_kjlan}5.   ${gl_bai}卸载"
-    echo -e "${gl_kjlan}6.   ${gl_bai}查看封禁的IP"
-    echo -e "${gl_kjlan}7.   ${gl_bai}查看/管理白名单"
+    echo -e "${gl_kjlan}4.   ${gl_bai}查看成功统计 TOP50"
+    echo -e "${gl_kjlan}5.   ${gl_bai}查看失败统计 TOP50"
+    echo -e "${gl_kjlan}6.   ${gl_bai}卸载"
+    echo -e "${gl_kjlan}7.   ${gl_bai}查看封禁的IP"
+    echo -e "${gl_kjlan}8.   ${gl_bai}查看/管理白名单"
+    echo -e "${gl_kjlan}9.   ${gl_bai}查看日志占用/手动清理"
     echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级"
     echo -e "${gl_kjlan}------------------------${gl_bai}"
 
@@ -12923,10 +12925,7 @@ EOF
 
             docker rm -f fail2ban >/dev/null 2>&1 || true
 
-            echo "清理可能导致配置冲突的 SSH 配置..."
-
-            rm -f /home/docker/fail2ban/config/fail2ban/jail.d/sshd.conf
-            rm -f /home/docker/fail2ban/config/fail2ban/jail.d/sshd.local
+            echo "保留现有 SSH 防护配置，避免更新后需要重新配置..."
 
             echo "重新创建 Fail2Ban..."
 
@@ -13169,156 +13168,204 @@ EOF
         4)
             clear
 
-            echo "▶️ SSH 登录来源统计 TOP 10"
-            echo "说明: 统计最近7天 SSH 登录成功/失败来源 IP。"
+            echo "▶️ SSH 登录成功来源统计 TOP 50"
+            echo "说明: 只统计最近7天 SSH 登录成功来源 IP，成功次数多的优先显示。"
             echo "------------------------"
 
             tmp_ssh_stats=$(mktemp)
+            tmp_ssh_table=$(mktemp)
 
-            # Debian 使用 systemd-journald
             if command -v journalctl &>/dev/null; then
-                journalctl -u ssh \
-                    --since "7 days ago" \
-                    --no-pager 2>/dev/null \
+                journalctl -u ssh --since "7 days ago" --no-pager 2>/dev/null \
                     | grep -E 'sshd.*(Accepted|Failed password|Invalid user|authentication failure)' \
                     > "$tmp_ssh_stats"
             fi
 
-            # 如果 ssh.service 没有结果，再尝试 sshd.service
             if [ ! -s "$tmp_ssh_stats" ] && command -v journalctl &>/dev/null; then
-                journalctl -u sshd \
-                    --since "7 days ago" \
-                    --no-pager 2>/dev/null \
+                journalctl -u sshd --since "7 days ago" --no-pager 2>/dev/null \
                     | grep -E 'sshd.*(Accepted|Failed password|Invalid user|authentication failure)' \
                     > "$tmp_ssh_stats"
             fi
 
-            printf "%-20s %-8s %-8s %-8s\n" "IP" "成功" "失败" "总计"
-            echo "------------------------------------------------"
+            fail2ban_conf="/home/docker/fail2ban/config/fail2ban/jail.d/sshd.local"
+            whitelist=""
+            if [ -f "$fail2ban_conf" ]; then
+                whitelist=$(grep -E '^[[:space:]]*ignoreip[[:space:]]*=' "$fail2ban_conf" 2>/dev/null | tail -n1 | cut -d= -f2- | xargs)
+            fi
+
+            banned_ips=""
+            if docker inspect fail2ban &>/dev/null && \
+               docker exec fail2ban fail2ban-client ping &>/dev/null && \
+               docker exec fail2ban fail2ban-client status sshd &>/dev/null; then
+                banned_ips=$(docker exec fail2ban fail2ban-client get sshd banip 2>/dev/null || true)
+                if [ -z "$banned_ips" ]; then
+                    banned_ips=$(docker exec fail2ban fail2ban-client status sshd 2>/dev/null | sed -n 's/^.*Banned IP list:[[:space:]]*//p')
+                fi
+            fi
 
             awk '
             {
-                ip=""
-                type=""
-
+                ip=""; type=""
                 if ($0 ~ /Accepted/) {
-                    for (i=1; i<=NF; i++) {
-                        if ($i == "from") {
-                            ip=$(i+1)
-                            type="ok"
-                            break
-                        }
-                    }
+                    for (i=1; i<=NF; i++) if ($i == "from") { ip=$(i+1); type="ok"; break }
+                } else if ($0 ~ /Failed password/ || $0 ~ /Invalid user/) {
+                    for (i=1; i<=NF; i++) if ($i == "from") { ip=$(i+1); type="fail"; break }
+                } else if ($0 ~ /authentication failure/) {
+                    for (i=1; i<=NF; i++) if ($i ~ /^rhost=/) { ip=$i; sub(/^rhost=/, "", ip); type="fail"; break }
                 }
-
-                else if ($0 ~ /Failed password/) {
-                    for (i=1; i<=NF; i++) {
-                        if ($i == "from") {
-                            ip=$(i+1)
-                            type="fail"
-                            break
-                        }
-                    }
-                }
-
-                else if ($0 ~ /Invalid user/) {
-                    for (i=1; i<=NF; i++) {
-                        if ($i == "from") {
-                            ip=$(i+1)
-                            type="fail"
-                            break
-                        }
-                    }
-                }
-
-                else if ($0 ~ /authentication failure/) {
-                    for (i=1; i<=NF; i++) {
-                        if ($i ~ /^rhost=/) {
-                            ip=$i
-                            sub(/^rhost=/, "", ip)
-                            type="fail"
-                            break
-                        }
-                    }
-                }
-
                 if (ip != "") {
-                    if (type == "ok") {
-                        success[ip]++
-                    }
-                    else if (type == "fail") {
-                        failed[ip]++
-                    }
+                    gsub(/[^0-9A-Fa-f:.]/, "", ip)
+                    if (type == "ok") success[ip]++
+                    else if (type == "fail") failed[ip]++
                 }
             }
-
             END {
                 for (ip in success) {
-                    total[ip] = success[ip] + failed[ip]
-                    seen[ip] = 1
+                    if (success[ip] > 0) printf "%s %d %d %d\n", ip, success[ip]+0, failed[ip]+0, success[ip]+failed[ip]
                 }
+            }' "$tmp_ssh_stats" | sort -k2,2nr -k4,4nr | head -50 > "$tmp_ssh_table"
 
-                for (ip in failed) {
-                    total[ip] = success[ip] + failed[ip]
-                    seen[ip] = 1
-                }
+            printf "%-20s %-8s %-8s %-8s %s\n" "IP" "成功" "失败" "总计" "状态"
+            echo "------------------------------------------------"
 
-                for (ip in seen) {
-                    printf "%s %d %d %d\n", \
-                        ip, \
-                        success[ip]+0, \
-                        failed[ip]+0, \
-                        total[ip]+0
-                }
-            }
-            ' "$tmp_ssh_stats" \
-            | sort -k4,4nr \
-            | head -10 \
-            | awk '{
-                printf "%-20s %-8s %-8s %-8s\n",
-                $1, $2"次", $3"次", $4"次"
-            }'
-
-            if [ ! -s "$tmp_ssh_stats" ]; then
-                echo
-                echo -e "${gl_huang}最近7天没有统计到 SSH 成功/失败登录记录。${gl_bai}"
-                echo "查看原始日志:"
-                echo "journalctl -u ssh --since '7 days ago' --no-pager"
+            if [ ! -s "$tmp_ssh_table" ]; then
+                echo -e "${gl_huang}最近7天没有统计到 SSH 成功登录记录。${gl_bai}"
+            else
+                while read -r stat_ip stat_ok stat_fail stat_total; do
+                    if echo " $whitelist " | grep -Fqw -- "$stat_ip"; then
+                        stat_status="${gl_lv}白名单${gl_bai}"
+                    elif echo " $banned_ips " | grep -Fqw -- "$stat_ip"; then
+                        stat_status="${gl_hong}已封禁${gl_bai}"
+                    else
+                        stat_status="${gl_huang}未封禁${gl_bai}"
+                    fi
+                    printf "%-20s %-8s %-8s %-8s %b\n" "$stat_ip" "${stat_ok}次" "${stat_fail}次" "${stat_total}次" "$stat_status"
+                done < "$tmp_ssh_table"
             fi
 
-            rm -f "$tmp_ssh_stats"
+            rm -f "$tmp_ssh_stats" "$tmp_ssh_table"
 
             echo "------------------------------------------------"
             echo "说明: 这是日志统计，不会修改或清除日志。"
             echo "日志保留时间取决于 systemd-journald 策略。"
 
             if docker inspect fail2ban &>/dev/null; then
-
                 if docker exec fail2ban fail2ban-client ping &>/dev/null; then
-
                     if docker exec fail2ban fail2ban-client status sshd &>/dev/null; then
-
                         echo "Fail2Ban容器状态:"
                         docker exec fail2ban fail2ban-client status sshd
-
                     else
-
                         echo -e "${gl_hong}Fail2Ban运行，但 sshd jail 未启动。${gl_bai}"
-
                     fi
-
                 else
-
                     echo -e "${gl_hong}Fail2Ban服务未正常运行。${gl_bai}"
-
                 fi
-
             fi
 
             read -n1 -r -p "按任意键继续..."
             ;;
 
         5)
+            clear
+
+            echo "▶️ SSH 登录来源统计 TOP 50"
+            echo "说明: 统计最近7天 SSH 登录成功/失败来源 IP。"
+            echo "------------------------"
+
+            tmp_ssh_stats=$(mktemp)
+            tmp_ssh_table=$(mktemp)
+
+            if command -v journalctl &>/dev/null; then
+                journalctl -u ssh --since "7 days ago" --no-pager 2>/dev/null \
+                    | grep -E 'sshd.*(Accepted|Failed password|Invalid user|authentication failure)' \
+                    > "$tmp_ssh_stats"
+            fi
+
+            if [ ! -s "$tmp_ssh_stats" ] && command -v journalctl &>/dev/null; then
+                journalctl -u sshd --since "7 days ago" --no-pager 2>/dev/null \
+                    | grep -E 'sshd.*(Accepted|Failed password|Invalid user|authentication failure)' \
+                    > "$tmp_ssh_stats"
+            fi
+
+            fail2ban_conf="/home/docker/fail2ban/config/fail2ban/jail.d/sshd.local"
+            whitelist=""
+            if [ -f "$fail2ban_conf" ]; then
+                whitelist=$(grep -E '^[[:space:]]*ignoreip[[:space:]]*=' "$fail2ban_conf" 2>/dev/null | tail -n1 | cut -d= -f2- | xargs)
+            fi
+
+            banned_ips=""
+            if docker inspect fail2ban &>/dev/null && \
+               docker exec fail2ban fail2ban-client ping &>/dev/null && \
+               docker exec fail2ban fail2ban-client status sshd &>/dev/null; then
+                banned_ips=$(docker exec fail2ban fail2ban-client get sshd banip 2>/dev/null || true)
+                if [ -z "$banned_ips" ]; then
+                    banned_ips=$(docker exec fail2ban fail2ban-client status sshd 2>/dev/null | sed -n 's/^.*Banned IP list:[[:space:]]*//p')
+                fi
+            fi
+
+            awk '
+            {
+                ip=""; type=""
+                if ($0 ~ /Accepted/) {
+                    for (i=1; i<=NF; i++) if ($i == "from") { ip=$(i+1); type="ok"; break }
+                } else if ($0 ~ /Failed password/ || $0 ~ /Invalid user/) {
+                    for (i=1; i<=NF; i++) if ($i == "from") { ip=$(i+1); type="fail"; break }
+                } else if ($0 ~ /authentication failure/) {
+                    for (i=1; i<=NF; i++) if ($i ~ /^rhost=/) { ip=$i; sub(/^rhost=/, "", ip); type="fail"; break }
+                }
+                if (ip != "") {
+                    gsub(/[^0-9A-Fa-f:.]/, "", ip)
+                    if (type == "ok") success[ip]++
+                    else if (type == "fail") failed[ip]++
+                }
+            }
+            END {
+                for (ip in failed) {
+                    if (failed[ip] > 0) printf "%s %d %d %d\n", ip, success[ip]+0, failed[ip]+0, success[ip]+failed[ip]
+                }
+            }' "$tmp_ssh_stats" | sort -k3,3nr -k4,4nr | head -50 > "$tmp_ssh_table"
+
+            printf "%-20s %-8s %-8s %-8s %s\n" "IP" "成功" "失败" "总计" "状态"
+            echo "------------------------------------------------"
+
+            if [ ! -s "$tmp_ssh_table" ]; then
+                echo -e "${gl_huang}最近7天没有统计到 SSH 失败登录记录。${gl_bai}"
+            else
+                while read -r stat_ip stat_ok stat_fail stat_total; do
+                    if echo " $whitelist " | grep -Fqw -- "$stat_ip"; then
+                        stat_status="${gl_lv}白名单${gl_bai}"
+                    elif echo " $banned_ips " | grep -Fqw -- "$stat_ip"; then
+                        stat_status="${gl_hong}已封禁${gl_bai}"
+                    else
+                        stat_status="${gl_huang}未封禁${gl_bai}"
+                    fi
+                    printf "%-20s %-8s %-8s %-8s %b\n" "$stat_ip" "${stat_ok}次" "${stat_fail}次" "${stat_total}次" "$stat_status"
+                done < "$tmp_ssh_table"
+            fi
+
+            rm -f "$tmp_ssh_stats" "$tmp_ssh_table"
+
+            echo "------------------------------------------------"
+            echo "说明: 这是日志统计，不会修改或清除日志。"
+            echo "日志保留时间取决于 systemd-journald 策略。"
+
+            if docker inspect fail2ban &>/dev/null; then
+                if docker exec fail2ban fail2ban-client ping &>/dev/null; then
+                    if docker exec fail2ban fail2ban-client status sshd &>/dev/null; then
+                        echo "Fail2Ban容器状态:"
+                        docker exec fail2ban fail2ban-client status sshd
+                    else
+                        echo -e "${gl_hong}Fail2Ban运行，但 sshd jail 未启动。${gl_bai}"
+                    fi
+                else
+                    echo -e "${gl_hong}Fail2Ban服务未正常运行。${gl_bai}"
+                fi
+            fi
+
+            read -n1 -r -p "按任意键继续..."
+            ;;
+
+        6)
             clear
 
             if [ "$EUID" -ne 0 ]; then
@@ -13335,6 +13382,7 @@ EOF
                     docker rm -f fail2ban >/dev/null 2>&1 || true
                     rm -rf /home/docker/fail2ban
                     rm -f /etc/logrotate.d/fail2ban-docker
+                    rm -f /etc/logrotate.d/authlog-ssh
 
                     echo -e "${gl_lv}Fail2Ban 已卸载，配置目录已删除。${gl_bai}"
                     ;;
@@ -13348,38 +13396,172 @@ EOF
             read -n1 -r -p "按任意键继续..."
             ;;
 
-        6)
-            clear
-            echo "▶️ 当前封禁的 IP"
-            echo "------------------------"
-            if ! docker inspect fail2ban &>/dev/null; then
-                echo -e "${gl_hong}未检测到 fail2ban 容器。${gl_bai}"
-            elif ! docker exec fail2ban fail2ban-client ping &>/dev/null; then
-                echo -e "${gl_hong}Fail2Ban 服务未正常运行。${gl_bai}"
-            elif ! docker exec fail2ban fail2ban-client status sshd &>/dev/null; then
-                echo -e "${gl_hong}sshd jail 未启动，请先选择 3 配置。${gl_bai}"
-            else
-                banned_ips=$(docker exec fail2ban fail2ban-client get sshd banip 2>/dev/null || true)
-                if [ -z "$banned_ips" ]; then
-                    banned_ips=$(docker exec fail2ban fail2ban-client status sshd 2>/dev/null | sed -n 's/^.*Banned IP list:[[:space:]]*//p')
-                fi
-                if [ -z "$banned_ips" ]; then
-                    echo "当前没有封禁IP"
-                else
-                    i=1
-                    for ip in $banned_ips; do
-                        echo "$i. $ip"
-                        i=$((i + 1))
-                    done
-                fi
-            fi
-            read -n1 -r -p "按任意键继续..."
-            ;;
-
         7)
             while true; do
                 clear
+                echo "▶️ 当前封禁的 IP"
+                echo "------------------------"
+                echo "失败多优先显示"
+                echo "------------------------"
+
+                banned_ips=""
+                banned_display_ips=""
+                fail2ban_conf="/home/docker/fail2ban/config/fail2ban/jail.d/sshd.local"
+                whitelist=""
+                if [ -f "$fail2ban_conf" ]; then
+                    whitelist=$(grep -E '^[[:space:]]*ignoreip[[:space:]]*=' "$fail2ban_conf" 2>/dev/null | tail -n1 | cut -d= -f2- | xargs)
+                fi
+
+                tmp_ssh_stats=$(mktemp)
+                tmp_ip_stats=$(mktemp)
+                tmp_banned_table=$(mktemp)
+                tmp_banned_sorted=$(mktemp)
+
+                if command -v journalctl &>/dev/null; then
+                    journalctl -u ssh --since "7 days ago" --no-pager 2>/dev/null \
+                        | grep -E 'sshd.*(Accepted|Failed password|Invalid user|authentication failure)' \
+                        > "$tmp_ssh_stats"
+                fi
+                if [ ! -s "$tmp_ssh_stats" ] && command -v journalctl &>/dev/null; then
+                    journalctl -u sshd --since "7 days ago" --no-pager 2>/dev/null \
+                        | grep -E 'sshd.*(Accepted|Failed password|Invalid user|authentication failure)' \
+                        > "$tmp_ssh_stats"
+                fi
+
+                awk '
+                {
+                    ip=""; type=""
+                    if ($0 ~ /Accepted/) {
+                        for (i=1; i<=NF; i++) if ($i == "from") { ip=$(i+1); type="ok"; break }
+                    } else if ($0 ~ /Failed password/ || $0 ~ /Invalid user/) {
+                        for (i=1; i<=NF; i++) if ($i == "from") { ip=$(i+1); type="fail"; break }
+                    } else if ($0 ~ /authentication failure/) {
+                        for (i=1; i<=NF; i++) if ($i ~ /^rhost=/) { ip=$i; sub(/^rhost=/, "", ip); type="fail"; break }
+                    }
+                    if (ip != "") {
+                        gsub(/[^0-9A-Fa-f:.]/, "", ip)
+                        if (type == "ok") success[ip]++
+                        else if (type == "fail") failed[ip]++
+                    }
+                }
+                END {
+                    for (ip in success) seen[ip]=1
+                    for (ip in failed) seen[ip]=1
+                    for (ip in seen) printf "%s %d %d %d\n", ip, success[ip]+0, failed[ip]+0, success[ip]+failed[ip]
+                }' "$tmp_ssh_stats" > "$tmp_ip_stats"
+
+                if ! docker inspect fail2ban &>/dev/null; then
+                    echo -e "${gl_hong}未检测到 fail2ban 容器。${gl_bai}"
+                elif ! docker exec fail2ban fail2ban-client ping &>/dev/null; then
+                    echo -e "${gl_hong}Fail2Ban 服务未正常运行。${gl_bai}"
+                elif ! docker exec fail2ban fail2ban-client status sshd &>/dev/null; then
+                    echo -e "${gl_hong}sshd jail 未启动，请先选择 3 配置。${gl_bai}"
+                else
+                    banned_ips=$(docker exec fail2ban fail2ban-client get sshd banip 2>/dev/null || true)
+                    if [ -z "$banned_ips" ]; then
+                        banned_ips=$(docker exec fail2ban fail2ban-client status sshd 2>/dev/null | sed -n 's/^.*Banned IP list:[[:space:]]*//p')
+                    fi
+
+                    printf "%-20s %-8s %-8s %-8s\n" "IP" "成功" "失败" "总计"
+                    echo "------------------------------------------------"
+
+                    if [ -z "$banned_ips" ]; then
+                        echo "当前没有封禁IP"
+                    else
+                        for ip in $banned_ips; do
+                            awk -v qip="$ip" '
+                                $1 == qip { print $0; found=1 }
+                                END { if (!found) print qip " 0 0 0" }
+                            ' "$tmp_ip_stats" >> "$tmp_banned_table"
+                        done
+                        sort -k3,3nr -k4,4nr "$tmp_banned_table" > "$tmp_banned_sorted"
+                        i=1
+                        while read -r stat_ip stat_ok stat_fail stat_total; do
+                            printf "%s. %-17s %-8s %-8s %-8s\n" "$i" "$stat_ip" "${stat_ok}次" "${stat_fail}次" "${stat_total}次"
+                            banned_display_ips="$banned_display_ips $stat_ip"
+                            i=$((i + 1))
+                        done < "$tmp_banned_sorted"
+                    fi
+                fi
+
+                rm -f "$tmp_ssh_stats" "$tmp_ip_stats" "$tmp_banned_table" "$tmp_banned_sorted"
+
+                echo "------------------------"
+                echo "1. 添加封禁IP"
+                echo "2. 删除封禁IP"
+                echo "0. 退出"
+                echo "------------------------"
+                read -e -p "请输入你的选择: " banned_choice
+                case "$banned_choice" in
+                    1)
+                        if ! docker inspect fail2ban &>/dev/null || \
+                           ! docker exec fail2ban fail2ban-client ping &>/dev/null || \
+                           ! docker exec fail2ban fail2ban-client status sshd &>/dev/null; then
+                            echo -e "${gl_hong}Fail2Ban 或 sshd jail 未正常运行，无法添加封禁。${gl_bai}"
+                            read -n1 -r -p "按任意键继续..."
+                            continue
+                        fi
+                        read -e -p "请输入要添加封禁的IP: " add_ban_ip
+                        if [ -z "$add_ban_ip" ]; then
+                            echo "未输入IP"
+                        elif echo " $whitelist " | grep -Fqw -- "$add_ban_ip"; then
+                            echo -e "${gl_huang}此IP在白名单配置中，白名单优先，无法添加封禁: $add_ban_ip${gl_bai}"
+                        else
+                            docker exec fail2ban fail2ban-client set sshd banip "$add_ban_ip" >/dev/null 2>&1
+                            if [ $? -eq 0 ]; then
+                                echo -e "${gl_lv}已添加封禁: $add_ban_ip${gl_bai}"
+                            else
+                                echo -e "${gl_hong}添加封禁失败: $add_ban_ip${gl_bai}"
+                            fi
+                        fi
+                        read -n1 -r -p "按任意键继续..."
+                        ;;
+                    2)
+                        if ! docker inspect fail2ban &>/dev/null || \
+                           ! docker exec fail2ban fail2ban-client ping &>/dev/null || \
+                           ! docker exec fail2ban fail2ban-client status sshd &>/dev/null; then
+                            echo -e "${gl_hong}Fail2Ban 或 sshd jail 未正常运行，无法删除封禁。${gl_bai}"
+                            read -n1 -r -p "按任意键继续..."
+                            continue
+                        fi
+                        read -e -p "请输入要删除封禁的IP或序号: " del_ban_input
+                        del_ban_ip=""
+                        if echo "$del_ban_input" | grep -Eq '^[0-9]+$'; then
+                            i=1
+                            for ip in $banned_display_ips; do
+                                if [ "$i" = "$del_ban_input" ]; then
+                                    del_ban_ip="$ip"
+                                    break
+                                fi
+                                i=$((i + 1))
+                            done
+                        else
+                            del_ban_ip="$del_ban_input"
+                        fi
+                        if [ -z "$del_ban_ip" ]; then
+                            echo "未找到该封禁IP"
+                        else
+                            docker exec fail2ban fail2ban-client set sshd unbanip "$del_ban_ip" >/dev/null 2>&1
+                            if [ $? -eq 0 ]; then
+                                echo -e "${gl_lv}已删除封禁: $del_ban_ip${gl_bai}"
+                            else
+                                echo -e "${gl_hong}删除封禁失败: $del_ban_ip${gl_bai}"
+                            fi
+                        fi
+                        read -n1 -r -p "按任意键继续..."
+                        ;;
+                    0) break ;;
+                    *) echo "无效选择"; read -n1 -r -p "按任意键继续..." ;;
+                esac
+            done
+            ;;
+
+        8)
+            while true; do
+                clear
                 echo "▶️ Fail2Ban SSH 白名单"
+                echo "------------------------"
+                echo "成功多优先显示"
                 echo "------------------------"
                 fail2ban_conf="/home/docker/fail2ban/config/fail2ban/jail.d/sshd.local"
                 fail2ban_default_conf="/home/docker/fail2ban/config/fail2ban/jail.local"
@@ -13390,11 +13572,65 @@ EOF
                 fi
                 whitelist=$(grep -E '^[[:space:]]*ignoreip[[:space:]]*=' "$fail2ban_conf" 2>/dev/null | tail -n1 | cut -d= -f2- | xargs)
                 whitelist=${whitelist:-127.0.0.1/8 ::1}
-                idx=1
+                whitelist_display_ips=""
+
+                tmp_ssh_stats=$(mktemp)
+                tmp_ip_stats=$(mktemp)
+                tmp_whitelist_table=$(mktemp)
+                tmp_whitelist_sorted=$(mktemp)
+
+                if command -v journalctl &>/dev/null; then
+                    journalctl -u ssh --since "7 days ago" --no-pager 2>/dev/null \
+                        | grep -E 'sshd.*(Accepted|Failed password|Invalid user|authentication failure)' \
+                        > "$tmp_ssh_stats"
+                fi
+                if [ ! -s "$tmp_ssh_stats" ] && command -v journalctl &>/dev/null; then
+                    journalctl -u sshd --since "7 days ago" --no-pager 2>/dev/null \
+                        | grep -E 'sshd.*(Accepted|Failed password|Invalid user|authentication failure)' \
+                        > "$tmp_ssh_stats"
+                fi
+
+                awk '
+                {
+                    ip=""; type=""
+                    if ($0 ~ /Accepted/) {
+                        for (i=1; i<=NF; i++) if ($i == "from") { ip=$(i+1); type="ok"; break }
+                    } else if ($0 ~ /Failed password/ || $0 ~ /Invalid user/) {
+                        for (i=1; i<=NF; i++) if ($i == "from") { ip=$(i+1); type="fail"; break }
+                    } else if ($0 ~ /authentication failure/) {
+                        for (i=1; i<=NF; i++) if ($i ~ /^rhost=/) { ip=$i; sub(/^rhost=/, "", ip); type="fail"; break }
+                    }
+                    if (ip != "") {
+                        gsub(/[^0-9A-Fa-f:.]/, "", ip)
+                        if (type == "ok") success[ip]++
+                        else if (type == "fail") failed[ip]++
+                    }
+                }
+                END {
+                    for (ip in success) seen[ip]=1
+                    for (ip in failed) seen[ip]=1
+                    for (ip in seen) printf "%s %d %d %d\n", ip, success[ip]+0, failed[ip]+0, success[ip]+failed[ip]
+                }' "$tmp_ssh_stats" > "$tmp_ip_stats"
+
                 for ip in $whitelist; do
-                    echo "$idx. $ip"
-                    idx=$((idx + 1))
+                    awk -v qip="$ip" '
+                        $1 == qip { print $0; found=1 }
+                        END { if (!found) print qip " 0 0 0" }
+                    ' "$tmp_ip_stats" >> "$tmp_whitelist_table"
                 done
+                sort -k2,2nr -k4,4nr "$tmp_whitelist_table" > "$tmp_whitelist_sorted"
+
+                printf "%-20s %-8s %-8s %-8s\n" "IP" "成功" "失败" "总计"
+                echo "------------------------------------------------"
+                idx=1
+                while read -r stat_ip stat_ok stat_fail stat_total; do
+                    printf "%s. %-17s %-8s %-8s %-8s\n" "$idx" "$stat_ip" "${stat_ok}次" "${stat_fail}次" "${stat_total}次"
+                    whitelist_display_ips="$whitelist_display_ips $stat_ip"
+                    idx=$((idx + 1))
+                done < "$tmp_whitelist_sorted"
+
+                rm -f "$tmp_ssh_stats" "$tmp_ip_stats" "$tmp_whitelist_table" "$tmp_whitelist_sorted"
+
                 echo "------------------------"
                 echo "1. 添加白名单IP"
                 echo "2. 删除白名单IP"
@@ -13406,14 +13642,18 @@ EOF
                         read -e -p "请输入要添加的白名单IP: " add_ip
                         if [ -z "$add_ip" ]; then
                             echo "未输入IP"
-                        elif echo " $whitelist " | grep -qw "$add_ip"; then
+                        elif echo " $whitelist " | grep -Fqw -- "$add_ip"; then
                             echo "该IP已在白名单中"
                         else
                             whitelist="$whitelist $add_ip"
                             sed -i "s|^[[:space:]]*ignoreip[[:space:]]*=.*|ignoreip = $whitelist|" "$fail2ban_conf"
                             [ -f "$fail2ban_default_conf" ] && sed -i "s|^[[:space:]]*ignoreip[[:space:]]*=.*|ignoreip = $whitelist|" "$fail2ban_default_conf"
+                            if docker inspect fail2ban &>/dev/null && docker exec fail2ban fail2ban-client ping &>/dev/null; then
+                                docker exec fail2ban fail2ban-client set sshd unbanip "$add_ip" >/dev/null 2>&1 || true
+                            fi
                             docker restart fail2ban >/dev/null 2>&1 || true
                             echo "已添加: $add_ip"
+                            echo "如果该IP原来被封禁，已尝试自动解除封禁。"
                         fi
                         read -n1 -r -p "按任意键继续..."
                         ;;
@@ -13427,7 +13667,7 @@ EOF
                         new_whitelist=""
                         idx=1
                         deleted_ip=""
-                        for ip in $whitelist; do
+                        for ip in $whitelist_display_ips; do
                             if [ "$idx" = "$del_idx" ]; then
                                 deleted_ip="$ip"
                             else
@@ -13446,6 +13686,115 @@ EOF
                             docker restart fail2ban >/dev/null 2>&1 || true
                             echo "已删除: $deleted_ip"
                         fi
+                        read -n1 -r -p "按任意键继续..."
+                        ;;
+                    0) break ;;
+                    *) echo "无效选择"; read -n1 -r -p "按任意键继续..." ;;
+                esac
+            done
+            ;;
+
+        9)
+            while true; do
+                clear
+                echo "▶️ 日志占用/手动清理"
+                echo "------------------------"
+                echo "1. 查看 systemd-journald 日志占用"
+                echo "2. 查看 systemd-journald 启动日志列表"
+                echo "3. 查看 Fail2Ban 本地目录大小"
+                echo "4. 查看 SSH 登录日志文件大小"
+                echo "9. 手动清理 systemd-journald 日志（不修改默认策略）"
+                echo "0. 退出"
+                echo "------------------------"
+                read -e -p "请输入你的选择: " log_size_choice
+                case "$log_size_choice" in
+                    1)
+                        clear
+                        echo "▶️ systemd-journald 日志占用"
+                        echo "------------------------"
+                        if command -v journalctl &>/dev/null; then
+                            journalctl --disk-usage
+                        else
+                            echo -e "${gl_hong}当前系统未找到 journalctl。${gl_bai}"
+                        fi
+                        echo "------------------------"
+                        echo "说明: 这是 systemd-journald 系统日志占用，不是 Fail2Ban 专属日志。"
+                        read -n1 -r -p "按任意键继续..."
+                        ;;
+                    2)
+                        clear
+                        echo "▶️ systemd-journald 启动日志列表"
+                        echo "------------------------"
+                        if command -v journalctl &>/dev/null; then
+                            journalctl --list-boots
+                        else
+                            echo -e "${gl_hong}当前系统未找到 journalctl。${gl_bai}"
+                        fi
+                        echo "------------------------"
+                        echo "说明: 显示系统保存了哪些开机周期的 journal 日志。"
+                        read -n1 -r -p "按任意键继续..."
+                        ;;
+                    3)
+                        clear
+                        echo "▶️ Fail2Ban 本地目录大小"
+                        echo "------------------------"
+                        if [ -d /home/docker/fail2ban ]; then
+                            du -sh /home/docker/fail2ban 2>/dev/null
+                            echo "------------------------"
+                            du -h --max-depth=2 /home/docker/fail2ban 2>/dev/null | sort -hr | head -30
+                        else
+                            echo -e "${gl_huang}未找到目录: /home/docker/fail2ban${gl_bai}"
+                        fi
+                        read -n1 -r -p "按任意键继续..."
+                        ;;
+                    4)
+                        clear
+                        echo "▶️ SSH 登录日志文件大小"
+                        echo "------------------------"
+                        found_log="false"
+                        for log_file in /var/log/auth.log /var/log/auth.log.* /var/log/secure /var/log/secure.*; do
+                            if [ -e "$log_file" ]; then
+                                found_log="true"
+                                du -h "$log_file" 2>/dev/null
+                            fi
+                        done
+                        if [ "$found_log" != "true" ]; then
+                            echo -e "${gl_huang}未找到 /var/log/auth.log 或 /var/log/secure 相关日志文件。${gl_bai}"
+                        fi
+                        echo "------------------------"
+                        echo "说明: 这些是 SSH 登录成功/失败统计可能读取的本机日志文件。"
+                        read -n1 -r -p "按任意键继续..."
+                        ;;
+                    9)
+                        clear
+                        echo "▶️ 手动清理 systemd-journald 日志"
+                        echo "------------------------"
+                        echo "说明: 只执行本次清理，不修改 /etc/systemd/journald.conf 默认策略。"
+                        echo "清理目标: 保留最近7天，并尽量控制 journal 总占用不超过 200M。"
+                        echo "影响范围: systemd-journald 系统日志，不是 Fail2Ban 专属日志。"
+                        echo "------------------------"
+                        if ! command -v journalctl &>/dev/null; then
+                            echo -e "${gl_hong}当前系统未找到 journalctl。${gl_bai}"
+                            read -n1 -r -p "按任意键继续..."
+                            continue
+                        fi
+                        echo "清理前占用:"
+                        journalctl --disk-usage
+                        echo "------------------------"
+                        read -e -p "确定执行本次 journal 日志清理吗？(Y/N): " clean_confirm
+                        case "$clean_confirm" in
+                            [Yy])
+                                journalctl --vacuum-time=7d
+                                journalctl --vacuum-size=200M
+                                echo "------------------------"
+                                echo "清理后占用:"
+                                journalctl --disk-usage
+                                echo -e "${gl_lv}清理完成，系统默认日志策略未修改。${gl_bai}"
+                                ;;
+                            *)
+                                echo "已取消清理"
+                                ;;
+                        esac
                         read -n1 -r -p "按任意键继续..."
                         ;;
                     0) break ;;
