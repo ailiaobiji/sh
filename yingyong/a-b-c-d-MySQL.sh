@@ -640,6 +640,37 @@ POLICY_DRY_RUN 是恢复策略部署闸门，区别于 CLI --dry-run；后者控
 
 @@ABC_END
 
+@@ABC_FILE docs/DOMAIN-TRANSACTIONS.md 600 aab518fa81b6bb534347982a69ef83a8e5b4fd5b4e9fe0d235a549fd62937455
+# 第二批第一项：分域离线事务
+
+## 本次范围
+仅生产/监控/物理登记事务域隔离；不开展CF、报告导出、日志模块或后续模型整改，不执行基础设施动作。
+
+## 存储
+显式初始化后的data/domain-model/包含：
+- registry.lock、registry/state.json、registry/transaction.json：共享物理身份/资源/兼任策略。
+- production.lock、production/state.json、production/transaction.json：生产角色、复制/文件/专用配置及迁移任务。
+- monitoring.lock、monitoring/state.json、monitoring/transaction.json：逻辑监控、环境、优先级与监控任期。
+- enabled.json：只在初始化完成后发布。
+
+每域独立version、generation、operation_id索引、audit及PREPARED恢复记录；审计属于该域原子状态，不是普通日志，不自动轮转/删除。DomainStore.audit(domain)独立查询。目录0700、文件0600。
+
+## 兼容
+新菜单首次明确双确认提交且没有旧模型时，显式创建分域模型；打开菜单不初始化。旧schema3保留原事务实现及已有文件，不自动迁移；启用分域后旧Store写入通过同一个域路由，旧整数版本请求拒绝。旧schema2写入及真实采集在分域模型存在时阻断。旧离线策略适配属于下一项，不在本次修改。
+
+生产和监控不再读改写同一个整拓扑JSON。只读resolver组合三个域形成schema3兼容视图；版本为production版本并另有完整domain_versions。请求必须携带版本向量：本域与物理登记CAS，不因对侧域版本独立增加而误拒绝；所有操作依最新组合状态做跨职能约束校验。
+
+生产Fencing只改变production_isolated，不改共享物理lifecycle或监控角色。旧schema3仍保留原行为，避免静默重解释原文件。
+
+## 锁与限制（必须披露）
+各业务域锁独立，长迁移意图不持锁，可交错推进监控事务。另有commit.lock短时共享提交门，用于一致组合/跨域资源检查及单域发布；该门内含本地fsync，会有短时等待。**这不是“任何情况下完全不共享锁、不阻塞”的实现**。持production.lock不阻止monitor事务，反之亦然；但持commit.lock仍会阻塞两者。若验收要求禁止任何共同提交门，本项仍属部分完成，需另行设计不可变共享登记和跨域资源预留协议，不能删门导致覆盖/资格竞态。
+
+同域PREPARED/发布中断由同请求重试恢复；只读菜单发现未提交事务明确拒绝，不自动改状态；其他域可独立提交，恢复只发布目标域，不覆盖另一域更新。初始化marker前中断保留材料，拒绝重新初始化，需人工处理。
+
+本次不提供旧状态自动迁移，不宣称断电持久化、分布式锁/租约、真实监控权威、真实Fencing或MySQL切换。
+
+@@ABC_END
+
 @@ABC_FILE docs/FORMAL-MENU-STAGE2.md 600 30bc6d938de7186f2baf609e7e83f24329f77d012ab56a9a8e35e6922bd0dba8
 # 正式菜单阶段二使用与限制
 
@@ -1120,7 +1151,7 @@ handle_error() { printf '操作未完成，返回菜单（退出码 %s）。\n' 
 
 @@ABC_END
 
-@@ABC_FILE modules/dashboard.py 600 de179bf241b53be152e7154476836e3a3a1c89bb401e2e49a0c3cebb15df1e04
+@@ABC_FILE modules/dashboard.py 600 36e7996f0e8e9f8ee5fd7327da7310684a774f0141fb02c9f230d4de31fff0c5
 """ABCD status panel: live observations and offline roles are never conflated."""
 from pathlib import Path
 import os
@@ -1158,7 +1189,7 @@ def panel(root, color=False):
         try:model=Store(root).load();version=str(model['version'])+'（离线模型）'
         except (OSError,ValueError,KeyError):version='暂无（拓扑损坏或不可读取）'
     function_path=root/'data/offline-functions/topology.json'
-    if function_path.exists() or function_path.is_symlink():
+    if function_path.exists() or function_path.is_symlink() or (root/'data/domain-model/enabled.json').exists():
         try:
             from node_functions import Store as FunctionStore
             f=FunctionStore(root).load()
@@ -1199,7 +1230,212 @@ if __name__=='__main__':
 
 @@ABC_END
 
-@@ABC_FILE modules/dynamic_preview.py 600 cdfeb156303f2a193989fdd962cf8595bdb868a0e52a0e8b3849d6a669550530
+@@ABC_FILE modules/domain_store.py 600 de82c012636b748c830a462059f1a3259c7d61813a4876dcc7baa7b8ed86ab94
+"""Independent local offline transaction domains; no infrastructure executors.
+
+A read-only composed schema3 view preserves existing pure safety decisions.
+Only the selected domain's state is published. A brief metadata commit lock
+serializes cross-domain invariant checks, never an entire migration task.
+"""
+import copy
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
+import re
+import time
+from topology_model import Store as PrivateIO
+
+DOMAINS=('registry','production','monitoring')
+MONITOR_ACTIONS={'monitor_bind','monitor_unbind','monitor_handoff','primary_monitor','backup_monitor','remove_monitor','environment','environment_simulate'}
+REGISTRY_ACTIONS={'register','remark','qualify','lifecycle','join','activate','retire','policy','resources'}
+PRODUCTION_ACTIONS={'primary','replica','remove_production','production_bind','production_unbind','mysql','mysql_remove','ssh','ssh_remove','sync','sync_job','sync_pause','mysql_config','auto_policy','maintenance','maintenance_cancel','migration_create','migration_step','migration_cancel','migration_deadline','expiry_assess'}
+MONITOR_KEYS={'monitor_priority','monitor_bindings','environment','monitor_term'}
+
+
+def classify(action,fields):
+    if action=='initialize':return 'registry'
+    if action in MONITOR_ACTIONS:return 'monitoring'
+    if action in REGISTRY_ACTIONS:return 'registry'
+    if action in PRODUCTION_ACTIONS:return 'production'
+    if action=='priorities':
+        keys=set(fields)
+        if keys=={'production_priority'}:return 'production'
+        if keys=={'monitor_priority'}:return 'monitoring'
+        raise ValueError('优先级必须分功能域单独提交')
+    raise ValueError('动作未登记，禁止猜测功能域')
+
+
+def fingerprint(value):
+    return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
+
+
+class DomainStore(PrivateIO):
+    def __init__(self,root):
+        super().__init__(root);self.folder=self.root/'data/domain-model'
+    @property
+    def enabled(self):
+        return (self.folder/'enabled.json').exists() or (self.folder/'enabled.json').is_symlink()
+    def prepare(self):
+        super().prepare()
+        for name in DOMAINS:
+            path=self.folder/name;path.mkdir(mode=0o700,exist_ok=True);self.private(path,True)
+    def io(self,domain):
+        if domain not in DOMAINS:raise ValueError('未知功能域')
+        io=PrivateIO(self.root);io.folder=self.folder/domain;return io
+    @contextmanager
+    def locked(self,name,exclusive=True,nonblock=True):
+        path=self.folder/(name+'.lock')
+        flags=os.O_APPEND|os.O_WRONLY|os.O_NOFOLLOW
+        if exclusive:flags|=os.O_CREAT
+        fd=os.open(path,flags,0o600)
+        try:
+            self.private(path)
+            fcntl.flock(fd,(fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)|(fcntl.LOCK_NB if nonblock else 0))
+            yield
+        finally:os.close(fd)
+    def enable(self):
+        self.prepare()
+        with self.locked('bootstrap'):
+            if self.enabled:
+                self.marker();return
+            if any((self.root/p).exists() or (self.root/p).is_symlink() for p in ('data/offline-functions/topology.json','data/offline-topology/topology.json')):
+                raise ValueError('已有旧模型；禁止自动迁移或覆盖，需单独审核迁移')
+            for name in DOMAINS:
+                io=self.io(name)
+                if any(io.folder.iterdir()):raise ValueError('发现未完成初始化材料，需人工核对，不覆盖')
+            from node_functions import initial
+            model=initial()
+            from management_model import defaults
+            model['management']=defaults()
+            for name in DOMAINS:
+                self.io(name).write('state.json',dict(schema=1,mode='OFFLINE_DOMAIN',domain=name,version=0,generation=0,state=self.project(model,name),operations=[],audit=[]))
+            for name in (*DOMAINS,'commit'):
+                with self.locked(name):pass
+            # Marker last. Crash before marker leaves evidence and safely refuses reinitialization.
+            self.write('enabled.json',dict(schema=1,mode='OFFLINE_DOMAINS',domains=list(DOMAINS)))
+    def marker(self):
+        if self.read('enabled.json')!=dict(schema=1,mode='OFFLINE_DOMAINS',domains=list(DOMAINS)):raise ValueError('分域标识损坏')
+    def project(self,d,domain):
+        from management_model import settings
+        m=settings(d)
+        if domain=='registry':
+            return dict(nodes={n:{k:copy.deepcopy(v) for k,v in x.items() if k not in ('production','monitor')} for n,x in d['nodes'].items()},policy=copy.deepcopy(d['policy']))
+        if domain=='production':
+            # Fenced production eligibility is not the physical/monitor lifecycle.
+            return dict(roles={n:x['production'] for n,x in d['nodes'].items()},isolated=copy.deepcopy(d.get('production_isolated',[])),management={k:v for k,v in m.items() if k not in MONITOR_KEYS})
+        return dict(roles={n:x['monitor'] for n,x in d['nodes'].items()},effective_backup=d['effective_backup'],management={k:m[k] for k in MONITOR_KEYS})
+    def validate_record(self,r,domain):
+        if not isinstance(r,dict) or set(r)!={'schema','mode','domain','version','generation','state','operations','audit'} or r['schema']!=1 or r['mode']!='OFFLINE_DOMAIN' or r['domain']!=domain:raise ValueError('分域记录结构损坏')
+        if any(type(r[k]) is not int or r[k]<0 for k in ('version','generation')) or r['generation']!=r['version']:raise ValueError('分域版本/世代损坏')
+        if not isinstance(r['operations'],list) or not isinstance(r['audit'],list) or len(r['operations'])!=r['version'] or len(r['audit'])!=r['version']:raise ValueError('分域幂等/审计数量不一致')
+        ids=[]
+        for index,(op,audit) in enumerate(zip(r['operations'],r['audit']),1):
+            if not isinstance(op,dict) or set(op)!={'operation_id','fingerprint'} or not isinstance(op['operation_id'],str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',op['operation_id']) or not re.fullmatch(r'[a-f0-9]{64}',op.get('fingerprint','')):raise ValueError('分域请求标识损坏')
+            if not isinstance(audit,dict) or set(audit)!={'timestamp','operation_id','domain','action','before_version','after_version','result','reason_code','source'} or audit['operation_id']!=op['operation_id'] or audit['domain']!=domain or audit['before_version']!=index-1 or audit['after_version']!=index or audit['result']!='OFFLINE_COMMITTED' or audit['reason_code'] is not None or audit['source']!='local-offline-model' or not isinstance(audit['timestamp'],str):raise ValueError('分域审计结构损坏')
+            ids.append(op['operation_id'])
+        if len(ids)!=len(set(ids)):raise ValueError('分域请求ID重复')
+        s=r['state']
+        if not isinstance(s,dict):raise ValueError('分域状态不是对象')
+        if domain=='registry':
+            if set(s)!={'nodes','policy'} or set(s['nodes'])!=set('ABCD'):raise ValueError('物理登记结构损坏')
+            for n,x in s['nodes'].items():
+                if not isinstance(x,dict) or x.get('physical_id')!=n or 'production' in x or 'monitor' in x:raise ValueError('登记状态混入功能角色')
+        else:
+            expected={'roles','isolated','management'} if domain=='production' else {'roles','effective_backup','management'}
+            if set(s)!=expected or set(s['roles'])!=set('ABCD') or not isinstance(s['management'],dict):raise ValueError('功能域状态键损坏')
+            allowed=(None,'Primary','Replica') if domain=='production' else (None,'Primary Monitor','Backup Monitor')
+            if any(v not in allowed for v in s['roles'].values()):raise ValueError('功能域角色非法')
+            from management_model import defaults
+            keys=set(defaults())-MONITOR_KEYS if domain=='production' else MONITOR_KEYS
+            if set(s['management'])!=keys:raise ValueError('功能域配置越界')
+            if domain=='production' and (not isinstance(s['isolated'],list) or len(s['isolated'])!=len(set(s['isolated'])) or any(n not in 'ABCD' or len(n)!=1 for n in s['isolated'])):raise ValueError('生产隔离清单损坏')
+        return r
+    def records(self):
+        self.marker();return {n:self.validate_record(self.io(n).read('state.json'),n) for n in DOMAINS}
+    def compose(self,records):
+        from node_functions import initial,rebuild,validate
+        d=initial();d['nodes']=copy.deepcopy(records['registry']['state']['nodes']);d['policy']=copy.deepcopy(records['registry']['state']['policy'])
+        for n in 'ABCD':
+            d['nodes'][n]['production']=records['production']['state']['roles'][n]
+            d['nodes'][n]['monitor']=records['monitoring']['state']['roles'][n]
+        d['effective_backup']=records['monitoring']['state']['effective_backup']
+        d['management']=copy.deepcopy(records['production']['state']['management']);d['management'].update(copy.deepcopy(records['monitoring']['state']['management']))
+        d['production_isolated']=copy.deepcopy(records['production']['state']['isolated'])
+        d['domain_versions']={n:r['version'] for n,r in records.items()};d['version']=records['production']['version']
+        d['domain_generations']={n:r['generation'] for n,r in records.items()}
+        d['operations']=[];d['audit']=[a for name in DOMAINS for a in records[name]['audit']]
+        rebuild(d);return validate(d)
+    def load(self):
+        # No prepare/recovery on views. Refuse an uncommitted domain rather than
+        # silently treating a mixed checkpoint as operationally healthy.
+        with self.locked('commit',exclusive=False,nonblock=False):
+            records=self.records()
+            for name in DOMAINS:
+                io=self.io(name)
+                if (io.folder/'transaction.json').exists() and io.read('transaction.json').get('status')!='COMMITTED':raise ValueError('分域事务待恢复；菜单只读，不自动重放')
+            return self.compose(records)
+    def audit(self,domain):
+        with self.locked('commit',exclusive=False,nonblock=False):return copy.deepcopy(self.records()[domain]['audit'])
+    def recover(self,domain):
+        io=self.io(domain);p=io.folder/'transaction.json'
+        if not p.exists():return
+        j=io.read('transaction.json')
+        if not isinstance(j,dict) or j.get('domain')!=domain:raise ValueError('跨功能域或损坏事务，拒绝恢复')
+        if j.get('status')=='COMMITTED':
+            if set(j)!={'status','domain','version'} or type(j['version']) is not int:raise ValueError('提交标记损坏')
+            return
+        if set(j)!={'status','domain','before','before_digest','after','after_digest'} or j['status']!='PREPARED':raise ValueError('未知分域事务')
+        after=self.validate_record(j['after'],domain)
+        if type(j['before']) is not int or after['version']!=j['before']+1 or fingerprint(after)!=j['after_digest']:raise ValueError('恢复版本/内容不匹配')
+        records=self.records();current=records[domain]
+        if current['version']==after['version']:
+            if current!=after:raise ValueError('同版本状态不一致')
+        elif current['version']!=j['before'] or fingerprint(current)!=j['before_digest']:raise ValueError('恢复禁止覆盖已更新状态')
+        candidate=copy.deepcopy(records);candidate[domain]=after;self.compose(candidate)
+        io.write('state.json',after);io.write('transaction.json',dict(status='COMMITTED',domain=domain,version=after['version']))
+    def transaction(self,request,expected,action,node,fields=None,interrupt=None):
+        fields=copy.deepcopy(fields or {});domain=classify(action,fields)
+        if not isinstance(request,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',request):raise ValueError('operation_id非法')
+        if not isinstance(expected,dict) or set(expected)!=set(DOMAINS) or any(type(v) is not int or v<0 for v in expected.values()):raise ValueError('分域请求必须携带完整版本向量')
+        if not self.enabled:raise ValueError('尚未显式初始化分域模型')
+        self.prepare()
+        with self.locked(domain):
+            # Brief cross-domain validation/publication gate; no migration phase
+            # execution or user interaction ever takes place inside this gate.
+            with self.locked('commit',nonblock=False):
+                self.recover(domain);records=self.records();old=records[domain]
+                payload=dict(domain=domain,expected=expected,action=action,node=node,fields=fields)
+                fp=fingerprint(payload);prior=next((p for p in old['operations'] if p['operation_id']==request),None)
+                if prior:
+                    if prior['fingerprint']!=fp:raise ValueError('同域operation_id请求冲突')
+                    return self.compose(records)
+                if old['version']!=expected[domain] or records['registry']['version']!=expected['registry']:raise ValueError('功能域/物理登记CAS版本冲突')
+                before=self.compose(records)
+                from node_functions import change
+                supplied=copy.deepcopy(fields)
+                if action=='migration_step':supplied['operation_id']=request
+                updated=change(before,action,node,supplied) if action!='initialize' else copy.deepcopy(before)
+                if domain=='registry':
+                    # Physical lifecycle changes cannot silently unload roles.
+                    if any(before['nodes'][n]['production']!=updated['nodes'][n]['production'] or before['nodes'][n]['monitor']!=updated['nodes'][n]['monitor'] for n in 'ABCD'):raise ValueError('先分别卸载职能再调整物理生命周期')
+                for other in DOMAINS:
+                    if other!=domain and self.project(updated,other)!=self.project(before,other):raise ValueError('动作试图跨功能域写入，拒绝提交')
+                new=copy.deepcopy(old);new['state']=self.project(updated,domain);new['version']+=1;new['generation']+=1
+                new['operations'].append(dict(operation_id=request,fingerprint=fp))
+                new['audit'].append(dict(timestamp=time.strftime('%Y-%m-%dT%H:%M:%S+00:00',time.gmtime()),operation_id=request,domain=domain,action=action,before_version=old['version'],after_version=new['version'],result='OFFLINE_COMMITTED',reason_code=None,source='local-offline-model'))
+                self.validate_record(new,domain);records[domain]=new;result=self.compose(records)
+                io=self.io(domain);io.write('transaction.json',dict(status='PREPARED',domain=domain,before=old['version'],before_digest=fingerprint(old),after=new,after_digest=fingerprint(new)))
+                if interrupt=='prepared':raise InterruptedError('分域PREPARED中断')
+                io.write('state.json',new)
+                if interrupt=='published':raise InterruptedError('分域发布后中断')
+                io.write('transaction.json',dict(status='COMMITTED',domain=domain,version=new['version']))
+                return result
+
+@@ABC_END
+
+@@ABC_FILE modules/dynamic_preview.py 600 ceb376b214edb795f23f6b873ce040883fa1fca22c79d7975a77eaf2d84a684d
 """Read-only dynamic previews; all role/switch execution remains disabled."""
 import json
 from pathlib import Path
@@ -1208,7 +1444,7 @@ ROOT=Path(__file__).resolve().parents[1]
 
 def summary(kind):
     functions_path=ROOT/'data/offline-functions/topology.json'
-    if functions_path.exists() or functions_path.is_symlink():
+    if functions_path.exists() or functions_path.is_symlink() or (ROOT/'data/domain-model/enabled.json').exists():
         try:
             from node_functions import Store as FStore,targets as ftargets
             f=FStore(ROOT).load()
@@ -1275,7 +1511,7 @@ if __name__=='__main__':main()
 
 @@ABC_END
 
-@@ABC_FILE modules/management_model.py 600 1be7f412f362215e345e07f636ea6fa5e7a5d4270b7ca97894a5b9f1331072a6
+@@ABC_FILE modules/management_model.py 600 f3bb53c24e6c9cc534285ce83c981d52edf6ffbbfb788826ba1a356a4daa2c30
 """Stage-two extensions of schema3. Pure offline decisions, never an executor.
 Optional fields live in the existing functions topology, not a second registry.
 """
@@ -1379,8 +1615,8 @@ def local_environment():
 def edges(d,primary=None):
     source=primary or d['primary']
     if not source:return []
-    if d['nodes'][source]['lifecycle']!='Active':raise ValueError('隔离/非Active节点不能作为有效同步源')
-    return [[source,n] for n in settings(d)['production_priority'] if n!=source and d['nodes'][n]['lifecycle']=='Active' and d['nodes'][n]['production'] in ('Replica','Primary')]
+    if d['nodes'][source]['lifecycle']!='Active' or source in d.get('production_isolated',[]):raise ValueError('隔离/非Active节点不能作为有效同步源')
+    return [[source,n] for n in settings(d)['production_priority'] if n!=source and d['nodes'][n]['lifecycle']=='Active' and n not in d.get('production_isolated',[]) and d['nodes'][n]['production'] in ('Replica','Primary')]
 
 
 def channels(d,primary=None):
@@ -1391,7 +1627,7 @@ def channels(d,primary=None):
 def precheck(d,target,proof):
     problems=[];m=settings(d)
     if d['primary'] is None:problems.append('当前Primary身份不明确')
-    if target not in registered(d) or d['nodes'][target]['lifecycle']!='Active' or not d['nodes'][target]['production'] or target==d['primary']:problems.append('目标生产资格/身份无效')
+    if target not in registered(d) or d['nodes'][target]['lifecycle']!='Active' or target in d.get('production_isolated',[]) or not d['nodes'][target]['production'] or target==d['primary']:problems.append('目标生产资格/身份无效')
     if not resource_ok(d['nodes'][target]):problems.append('目标资源证据不足或过期')
     for k in CHECKS:
         if proof.get(k) is not True:problems.append(k+'未通过')
@@ -1590,7 +1826,10 @@ def change(d,action,node,f):
                 if stage=='WRITE_BARRIER':t['write_barrier']=True
                 if stage=='OLD_PRIMARY_FENCING':t['fenced']=True
                 if stage=='TOPOLOGY_COMMIT':
-                    old=d['nodes'][t['source']];old.update(production='Replica',lifecycle='Unreachable')
+                    old=d['nodes'][t['source']];old['production']='Replica'
+                    if 'domain_versions' in d:
+                        d['production_isolated']=list(dict.fromkeys(d.get('production_isolated',[])+[t['source']]))
+                    else:old['lifecycle']='Unreachable'
                     d['nodes'][t['target']]['production']='Primary';d['primary']=t['target'];m['production_term']+=1
                 if stage==AUTO_STAGES[-1]:
                     t.update(status='SIMULATED_COMPLETED',effective_at=now,expires_at=now+t['duration'] if t['kind']=='temporary' else None)
@@ -1601,7 +1840,7 @@ def change(d,action,node,f):
 
 @@ABC_END
 
-@@ABC_FILE modules/management_ui.py 600 047affa8ab77e47579047b14444a1c6684d26b471dbd697c47ef0d57f8fd6d5d
+@@ABC_FILE modules/management_ui.py 600 567211ebac949950a17de3705ec44784ecda3db19e068c5f7268412853f44a38
 """Formal stage-two UI. All observations and submissions explicitly offline.
 No subprocess/network executors. Ctrl-D/:quit cancels without staged writes.
 """
@@ -1662,6 +1901,8 @@ class UI:
     def __init__(self,root=ROOT,dry=False):
         self.root=Path(root);self.store=Store(root);self.dry=dry;self.target=None;self.duration=300;self.maintenance={}
     def load(self):
+        from domain_store import DomainStore
+        if DomainStore(self.root).enabled:return self.store.load()
         if (self.store.folder/'topology.json').exists() or (self.store.folder/'topology.json').is_symlink():return self.store.load()
         legacy=self.root/'data/offline-topology/topology.json'
         if legacy.exists() or legacy.is_symlink():raise ValueError('旧拓扑已存在：保留原数据，不自动创建竞争模型；需管理员审核显式迁移')
@@ -1677,7 +1918,13 @@ class UI:
         if self.dry:print('Dry-run：不创建锁、审计或配置。');return
         if ask('第一次确认，输入精确小写 yes：')!='yes':raise Cancel()
         if ask('第二次确认，输入精确小写 yes：')!='yes':raise Cancel()
-        result=self.store.transaction(request,d['version'],action,node,fields)
+        from domain_store import DomainStore
+        domains=DomainStore(self.root)
+        if not domains.enabled and not (self.store.folder/'topology.json').exists():
+            domains.enable()
+            expected=domains.load()['domain_versions']
+        else:expected=d.get('domain_versions',d['version'])
+        result=self.store.transaction(request,expected,action,node,fields)
         print('离线模型已提交；version='+str(result['version'])+'；不代表真实运行正常。')
     def pick(self,kind='registered'):
         d=self.load();m=settings(d)
@@ -1965,7 +2212,7 @@ CHILDREN={('7',22):'7c',('9',2):'9s',('9',3):'9t',('9',4):'9p',('9',5):'9m',('9'
 
 @@ABC_END
 
-@@ABC_FILE modules/monitor_engine.py 600 8c65abc47bf1660d54cf81ec9553b6df36c999d71368c4e2f477272749658263
+@@ABC_FILE modules/monitor_engine.py 600 734bbb85beb30dd411b46d2499fe8d5023b2c2078a8796975c8aa97f29ba7900
 #!/usr/bin/env python3
 """C-only monitoring: bounded read-only SSH, private snapshots/history, no data-plane writes."""
 from concurrent.futures import ThreadPoolExecutor
@@ -2129,6 +2376,8 @@ def files_status(now):
 
 
 def collect():
+    if (DATA/'domain-model/enabled.json').exists() or (DATA/'domain-model/enabled.json').is_symlink():
+        raise ValueError('分域离线模型存在；禁止用模拟角色执行真实采集')
     functions_path=DATA/'offline-functions/topology.json'
     if functions_path.exists() or functions_path.is_symlink():
         raise ValueError('独立功能离线模型存在；禁止将模拟职能用作真实SSH或协调授权')
@@ -2467,7 +2716,7 @@ if __name__ == '__main__':
 
 @@ABC_END
 
-@@ABC_FILE modules/node_functions.py 600 969ace41afd4d556c3b7e986236f48cbb306aeb66f137fb6744be7624699ddf3
+@@ABC_FILE modules/node_functions.py 600 08a779032b0aebc751207803e22de1fab702607c45eba83265d7c3493bdfd5cc
 """Symmetric node functions, offline schema3; no infrastructure executor."""
 import copy
 import time
@@ -2512,7 +2761,7 @@ def conflicts(data):
 def rebuild(data):
     data['primary']=next((n for n in IDS if data['nodes'][n]['production']=='Primary'),None)
     data['primary_monitor']=next((n for n in IDS if data['nodes'][n]['monitor']=='Primary Monitor'),None)
-    data['database_edges']=[[data['primary'],n] for n in IDS if data['primary'] and data['nodes'][data['primary']]['lifecycle']=='Active' and data['nodes'][n]['production']=='Replica' and data['nodes'][n]['lifecycle']=='Active']
+    data['database_edges']=[[data['primary'],n] for n in IDS if data['primary'] and data['nodes'][data['primary']]['lifecycle']=='Active' and data['primary'] not in data.get('production_isolated',[]) and data['nodes'][n]['production']=='Replica' and data['nodes'][n]['lifecycle']=='Active' and n not in data.get('production_isolated',[])]
     data['file_edges']=copy.deepcopy(data['database_edges'])
     backups=[n for n in IDS if data['nodes'][n]['monitor']=='Backup Monitor']
     if data.get('effective_backup') not in backups:data['effective_backup']=backups[0] if backups else None
@@ -2601,8 +2850,15 @@ def change(data,action,node,fields):
 class Store(LegacyStore):
     def __init__(self,project):
         super().__init__(project);self.folder=self.root/'data/offline-functions'
-    def load(self):return validate(self.read('topology.json'))
+    def load(self):
+        from domain_store import DomainStore
+        domains=DomainStore(self.root)
+        return domains.load() if domains.enabled else validate(self.read('topology.json'))
     def transaction(self,request,expected,action,node,fields=None,interrupt=None):
+        from domain_store import DomainStore
+        domains=DomainStore(self.root)
+        if domains.enabled:return domains.transaction(request,expected,action,node,fields,interrupt)
+        if isinstance(expected,dict):raise ValueError('分域模型未初始化；禁止回退旧事务')
         # Reuse private IO/locking but supply schema3 semantics through generic transaction implementation.
         import fcntl,os,json,hashlib,re,time
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',request):raise ValueError('operation_id非法')
@@ -3045,7 +3301,7 @@ show_c_status() {
 
 @@ABC_END
 
-@@ABC_FILE modules/topology_model.py 600 f215f51bab7f3abd4e1e39c0dc371192d57039061f72b5b3c7d3b33fe9624871
+@@ABC_FILE modules/topology_model.py 600 423850a4068affd6d7d345f5f35421e0eba718fd6dec732e8e6433c7906a3db7
 """Offline topology only. No SSH, SQL, DNS, sync or operational authority."""
 from pathlib import Path
 import copy
@@ -3180,6 +3436,7 @@ class Store:
             if os.path.exists(tmp):os.unlink(tmp)
     def load(self):return validate(self.read('topology.json'))
     def transaction(self,request,expected,action,node,fields=None,interrupt=None):
+        if (self.root/'data/domain-model/enabled.json').exists():raise ValueError('分域模型已启用；旧schema2禁止写入')
         if (self.root/'data/offline-functions/topology.json').exists():
             raise ValueError('新功能模型已存在；旧版模型禁止写入')
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',request):raise ValueError('operation_id非法')
@@ -4319,6 +4576,144 @@ for version in ('12','13'):
     finally:
         run(['docker','rm','-f',name])
 (root/'data/distribution-verification.txt').write_text('\n'.join(logs))
+
+@@ABC_END
+
+@@ABC_FILE tests/test_domains.py 600 71a03f57e6b3bee0a17050acc097724fa4e731750957943bbab09049b56a0464
+"""Second-batch item1, independent domain acceptance; offline fixtures only."""
+import copy
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+import unittest
+from pathlib import Path
+from test_framework import FrameworkTests,SOURCE
+sys.path.insert(0,str(SOURCE/'modules'))
+from domain_store import DomainStore,DOMAINS
+from management_model import CHECKS,AUTO_STAGES,STAGE_PROOF,channels
+from node_functions import Store
+
+class DomainTests(FrameworkTests):
+ def setup_domains(self):
+  self.ds=DomainStore(self.root);self.ds.enable();self.serial=0
+ def tx(self,action,node='A',fields=None,request=None,expected=None,interrupt=None):
+  self.serial+=1
+  return self.ds.transaction(request or 'd'+str(self.serial),expected or self.ds.load()['domain_versions'],action,node,fields or {},interrupt)
+ def resources(self):return dict(cpu=4,memory_mib=4096,disk_mib=10000,cpu_percent=10,io_percent=10,network_percent=10,reliable_state=True,isolated_processes=True,checked_at=int(time.time()))
+ def profile(self):return dict(id='ubuntu',version='24.04',installed=['python3','bash','util-linux','coreutils','openssh-client','rsync'],cpu=4,memory_mib=4096,disk_mib=10000,network=True,permissions=True,runtime_compatible=True)
+ def ready(self):
+  self.setup_domains();self.tx('policy',fields=dict(allow_colocation=True))
+  for n in 'ABCD':
+   self.tx('register',n,dict(identity='id-'+n,address='host-'+n,remark='备注'+n))
+   self.tx('qualify',n,dict(identity_verified=True,data_verified=True,resources=self.resources()))
+   self.tx('mysql',n,dict(address='10.0.0.'+str(ord(n)-64),port=3306,product='MySQL',version='8.4',server_id=ord(n),gtid=True,binlog=True,user='replicator',auth_ref='vault:mysql/'+n,sources=['10.0.0.0/24'],least_privilege=True,protected_network=True))
+   self.tx('production_bind',n)
+  self.tx('primary','A',dict(offline_verified=True,proof={k:True for k in CHECKS}))
+  self.tx('monitor_bind','A',dict(slot='A',profile=self.profile()))
+  self.tx('monitor_bind','C',dict(slot='B',profile=self.profile()))
+  self.tx('monitor_handoff','A',dict(slot='A',quorum=True,old_revoked=True,state_transfer=True,health=True,resources=True))
+ def digest(self,domain):
+  io=self.ds.io(domain)
+  return {p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in io.folder.iterdir() if p.is_file()}
+ def test_01_separate_state_locks_versions_generation_and_audit(self):
+  self.ready();d=self.ds.load()
+  self.assertEqual(d['primary'],'A');self.assertEqual(d['primary_monitor'],'A')
+  for name in DOMAINS:
+   self.assertTrue((self.ds.folder/(name+'.lock')).exists());r=self.ds.records()[name];self.assertEqual(r['generation'],r['version']);self.assertTrue(self.ds.audit(name));self.assertTrue(all(a['domain']==name for a in self.ds.audit(name)))
+  self.assertNotEqual(self.ds.io('production').folder,self.ds.io('monitoring').folder)
+ def test_02_holding_production_lock_allows_monitor_write(self):
+  self.ready();prod=self.digest('production')
+  with self.ds.locked('production'):
+   d=self.tx('environment','C',self.profile());self.assertEqual(d['primary'],'A')
+  self.assertEqual(prod,self.digest('production'))
+ def test_03_holding_monitor_lock_allows_production_write(self):
+  self.ready();mon=self.digest('monitoring')
+  with self.ds.locked('monitoring'):
+   d=self.tx('auto_policy',fields=dict(enabled=False,target='D',start_at=None))
+  self.assertEqual(mon,self.digest('monitoring'));self.assertEqual(d['primary_monitor'],'A')
+ def test_04_real_process_concurrent_writes_no_lost_update(self):
+  self.ready();v=self.ds.load()['domain_versions'];env=dict(self.env,PYTHONPATH=str(SOURCE/'modules'),PYTHONDONTWRITEBYTECODE='1')
+  code="from domain_store import DomainStore;import json,sys;s=DomainStore(sys.argv[1]);s.transaction(sys.argv[2],json.loads(sys.argv[3]),'priorities','A',json.loads(sys.argv[4]))"
+  processes=[subprocess.Popen([sys.executable,'-B','-c',code,str(self.root),'same-id',json.dumps(v),json.dumps(f)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env) for f in (dict(production_priority=list('DCBA')),dict(monitor_priority=list('CBA')))]
+  for p in processes:
+   stdout,stderr=p.communicate(timeout=10);self.assertEqual(p.returncode,0,stderr)
+  d=self.ds.load();self.assertEqual(d['management']['production_priority'],list('DCBA'));self.assertEqual(d['management']['monitor_priority'],list('CBA'))
+  self.assertEqual(d['domain_versions']['production'],v['production']+1);self.assertEqual(d['domain_versions']['monitoring'],v['monitoring']+1)
+ def test_05_same_domain_idempotent_conflict_and_stale(self):
+  self.ready();v=self.ds.load()['domain_versions'];f=dict(production_priority=list('DCBA'));self.tx('priorities',fields=f,request='idem',expected=v);d=self.ds.load();digest=self.digest('production')
+  self.tx('priorities',fields=f,request='idem',expected=v);self.assertEqual(digest,self.digest('production'))
+  with self.assertRaises(ValueError):self.tx('priorities',fields=dict(production_priority=list('ABCD')),request='idem',expected=v)
+  with self.assertRaises(ValueError):self.tx('priorities',fields=f,expected=v)
+ def test_06_prepared_recovery_preserves_other_domain(self):
+  self.ready();v=self.ds.load()['domain_versions'];f=dict(monitor_priority=list('CBA'))
+  with self.assertRaises(InterruptedError):self.tx('priorities',fields=f,request='recover-mon',expected=v,interrupt='prepared')
+  production=self.digest('production');self.ds.transaction('recover-mon',v,'priorities','A',f);self.assertEqual(production,self.digest('production'));self.assertEqual(self.ds.load()['management']['monitor_priority'],list('CBA'))
+ def test_07_published_recovery_preserves_other_domain(self):
+  self.ready();v=self.ds.load()['domain_versions'];f=dict(production_priority=list('DCBA'))
+  with self.assertRaises(InterruptedError):self.tx('priorities',fields=f,request='recover-prod',expected=v,interrupt='published')
+  monitor=self.digest('monitoring');self.ds.transaction('recover-prod',v,'priorities','A',f);self.assertEqual(monitor,self.digest('monitoring'))
+ def test_08_migration_monitor_handoff_interleaved(self):
+  self.ready();self.tx('migration_create','D',dict(kind='temporary',task='move-D',proof={k:True for k in CHECKS},duration=300))
+  for index,stage in enumerate(AUTO_STAGES[1:]):
+   if index==4:
+    self.tx('monitor_handoff','C',dict(slot='B',quorum=True,old_revoked=True,state_transfer=True,health=True,resources=True));self.assertEqual(self.ds.load()['primary'],'A')
+   self.tx('migration_step','D',dict(task='move-D',proof={v:True for v in STAGE_PROOF.values()}))
+  d=self.ds.load();self.assertEqual(d['primary'],'D');self.assertEqual(d['primary_monitor'],'C');self.assertEqual(d['nodes']['A']['lifecycle'],'Active');self.assertIn('A',d['production_isolated']);self.assertNotIn(['D','A'],d['database_edges']);self.assertEqual(d['management']['migration_tasks']['move-D']['status'],'SIMULATED_COMPLETED')
+ def test_09_cross_domain_journal_corruption_rejected(self):
+  self.ready();io=self.ds.io('production');io.write('transaction.json',dict(status='PREPARED',domain='monitoring'))
+  before=self.digest('monitoring')
+  with self.assertRaises(ValueError):self.ds.transaction('bad',{n:r['version'] for n,r in self.ds.records().items()},'auto_policy','A',dict(enabled=False))
+  self.assertEqual(before,self.digest('monitoring'))
+ def test_10_old_models_not_migrated_or_overwritten(self):
+  s=Store(self.root);s.transaction('legacy',0,'initialize','A');p=s.folder/'topology.json';old=p.read_bytes();d=DomainStore(self.root)
+  with self.assertRaises(ValueError):d.enable()
+  self.assertEqual(old,p.read_bytes());self.assertFalse(d.enabled)
+ def test_11_no_write_on_views_and_ui_uses_domains(self):
+  self.ready();before=self.snapshot();p=self.run_cli(text='3\n0\n4\n0\n9\n0\n0\n');self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(before,self.snapshot());self.assertEqual(Store(self.root).load()['primary'],'A')
+ def test_12_audit_fields_and_no_sensitive_content(self):
+  self.ready()
+  for name in ('production','monitoring'):
+   for row in self.ds.audit(name):
+    self.assertEqual(set(row),{'timestamp','operation_id','domain','action','before_version','after_version','result','reason_code','source'});self.assertIn('+00:00',row['timestamp']);self.assertNotIn('auth_ref',json.dumps(row));self.assertEqual(row['result'],'OFFLINE_COMMITTED')
+ def test_13_permissions_and_unsafe_paths(self):
+  self.ready()
+  for p in self.ds.folder.rglob('*'):
+   self.assertEqual(p.stat().st_mode&0o777,0o700 if p.is_dir() else 0o600)
+  io=self.ds.io('monitoring');p=io.folder/'state.json';p.chmod(0o644)
+  with self.assertRaises(ValueError):self.ds.load()
+ def test_14_old_schema2_write_blocked(self):
+  self.setup_domains();from topology_model import Store as OldStore
+  with self.assertRaises(ValueError):OldStore(self.root).transaction('old',0,'initialize','A')
+ def test_15_registry_change_does_not_drop_bound_roles(self):
+  self.ready();old=self.ds.load()
+  with self.assertRaises(ValueError):self.tx('retire','C')
+  self.assertEqual(old,self.ds.load())
+ def test_16_recovery_after_opposite_domain_commit(self):
+  self.ready();v=self.ds.load()['domain_versions'];f=dict(production_priority=list('DCBA'))
+  with self.assertRaises(InterruptedError):self.ds.transaction('pending',v,'priorities','A',f,'prepared')
+  self.ds.transaction('other',v,'priorities','A',dict(monitor_priority=list('CBA')))
+  other=self.digest('monitoring');self.ds.transaction('pending',v,'priorities','A',f)
+  self.assertEqual(other,self.digest('monitoring'));d=self.ds.load();self.assertEqual(d['management']['monitor_priority'],list('CBA'));self.assertEqual(d['management']['production_priority'],list('DCBA'))
+ def test_17_process_holding_domain_lock_does_not_block_other(self):
+  self.ready();env=dict(self.env,PYTHONPATH=str(SOURCE/'modules'))
+  code="from domain_store import DomainStore;import sys;s=DomainStore(sys.argv[1]);ctx=s.locked('production');ctx.__enter__();print('locked',flush=True);sys.stdin.readline();ctx.__exit__(None,None,None)"
+  p=subprocess.Popen([sys.executable,'-B','-c',code,str(self.root)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env)
+  try:
+   self.assertEqual(p.stdout.readline().strip(),'locked');d=self.tx('environment','C',self.profile());self.assertEqual(d['primary'],'A')
+   with self.assertRaises(BlockingIOError):self.tx('auto_policy',fields=dict(enabled=False))
+  finally:
+   p.communicate('\n',timeout=10)
+  self.assertEqual(p.returncode,0)
+ def test_18_first_actual_menu_write_initializes_domains(self):
+  p=self.run_cli(text='2\n1\nphysical-A\nhost-A\n备注A\nfirst-register\nyes\nyes\n\n0\n0\n')
+  self.assertEqual(p.returncode,0,p.stderr);self.ds=DomainStore(self.root);self.assertTrue(self.ds.enabled);d=self.ds.load();self.assertEqual(d['nodes']['A']['identity'],'physical-A');self.assertIsNone(d['primary']);self.assertFalse((self.root/'data/offline-functions/topology.json').exists())
+
+if __name__=='__main__':
+ r=unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(DomainTests(n) for n in DomainTests.__dict__ if n.startswith('test_')))
+ raise SystemExit(not r.wasSuccessful())
 
 @@ABC_END
 
