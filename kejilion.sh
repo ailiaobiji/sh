@@ -937,8 +937,8 @@ ldnmp_prepare_nginx_log_rotation() {
   done
   command -v python3 >/dev/null 2>&1 || install python3
   command -v python3 >/dev/null 2>&1 || return 1
-  mkdir -p /home/web/nginx-logrotate /home/web/log/nginx || return 1
-  local hook=/home/web/nginx-logrotate/40-size-rotate.sh
+  mkdir -p /home/web//log/nginx-log /home/web/log/nginx || return 1
+  local hook=/home/web//log/nginx-log/40-size-rotate.sh
   {
     printf '#!/bin/sh\nACCESS_KEEP=%s\nACCESS_SIZE_MB=%s\nERROR_KEEP=%s\nERROR_SIZE_MB=%s\nCHECK_SECONDS=%s\n' "$keep" "$size" "$error_keep" "$error_size" "$interval"
     cat <<'NGINX_ROTATE'
@@ -1001,9 +1001,17 @@ start = next((i for i, line in enumerate(lines) if re.fullmatch(r'  nginx:\s*\n?
 if start is None:
     raise SystemExit('未找到标准 nginx Compose 服务，未添加轮转挂载。')
 end = next((i for i in range(start+1, len(lines)) if lines[i].strip() and not lines[i].lstrip().startswith('#') and len(lines[i])-len(lines[i].lstrip()) <= 2), len(lines))
-mount = '      - ./nginx-logrotate/40-size-rotate.sh:/docker-entrypoint.d/40-size-rotate.sh:ro\n'
+mount = '      - ./log/nginx-log/40-size-rotate.sh:/docker-entrypoint.d/40-size-rotate.sh:ro\n'
 block = lines[start:end]
-if any('/docker-entrypoint.d/40-size-rotate.sh' in line for line in block):
+existing = [i for i in range(start+1, end) if '/docker-entrypoint.d/40-size-rotate.sh' in lines[i]]
+if existing:
+    # 更新旧版挂载源路径，同时删除同一入口脚本的重复挂载。
+    lines[existing[0]] = mount
+    for i in reversed(existing[1:]):
+        del lines[i]
+    updated = ''.join(lines)
+    if updated != path.read_text():
+        path.write_text(updated)
     raise SystemExit(0)
 vol = next((i for i in range(start+1, end) if re.fullmatch(r'    volumes:\s*\n?', lines[i])), None)
 if vol is None:
