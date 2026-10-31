@@ -6216,7 +6216,7 @@ linux_panel() {
     echo -e "${gl_kjlan}------------------------"
     echo -e "${gl_kjlan}996. ${gl_bai}CDN安装 ${gl_huang}★${gl_bai}\033[48G${gl_kjlan}997. ${gl_bai}PVE开小鸡面板"
     echo -e "${gl_kjlan}998. ${gl_bai}CDN迁移恢复 ${gl_huang}★${gl_bai}\033[48G${gl_kjlan}999. ${gl_bai}Webtop镜像版本管理 ${gl_huang}★${gl_bai}"
-    echo -e "${gl_kjlan}1000. ${gl_bai}fnOS 系统重装 ${gl_huang}★${gl_bai}\033[48G${gl_kjlan}1001. ${gl_bai}密码自动备份与恢复 ${gl_huang}★${gl_bai}"
+    echo -e "${gl_kjlan}1000. ${gl_bai}fnOS 系统重装 ${gl_huang}★${gl_bai}\033[48G${gl_kjlan}1001. ${gl_bai}主备容灾管理系统 ${gl_huang}★${gl_bai}"
     echo -e "${gl_kjlan}1002. ${gl_bai}win10长期服务版 ${gl_huang}★${gl_bai}\033[48G${gl_kjlan}1003. ${gl_bai}传送文件 ${gl_huang}★${gl_bai}"
     echo -e "$(panel_menu_item_green_if_installed 1004 "${gl_kjlan}1004. ${gl_bai}下载备份清理脚本 ${gl_huang}★${gl_bai}" "1004. 下载备份清理脚本 ★")\033[48G$(panel_menu_item_green_if_installed 1005 "${gl_kjlan}1005. ${gl_bai}网站论坛与其他备份合并 ${gl_huang}★${gl_bai}" "1005. 网站论坛与其他备份合并 ★")"
     echo -e "${gl_kjlan}------------------------"
@@ -11070,10 +11070,9 @@ EOF
 
 
       1001)
-        clear
-        echo "▶️ 正在启动定时远程备份与传送模块..."
-        bash <(curl -fsSL https://raw.githubusercontent.com/zaixiangjian/sh/main/zidongmima.sh)
-        echo "✅ 远程备份与传送模块执行完成。"
+        echo "▶️ 正在启动A-B-C MySQL 主备容灾管理系统..."
+        run_local_first_app_script "▶️ 安装A-B-C MySQL 主备容灾管理系统..." "/root/yingyong/a-b-c-MySQL.sh" "https://raw.githubusercontent.com/zaixiangjian/sh/refs/heads/main/yingyong/a-b-c-MySQL.sh"
+        echo "✅ A-B-C MySQL 主备容灾管理系统安装完成。"
         ;;
 
       1002)
