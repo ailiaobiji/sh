@@ -3363,7 +3363,7 @@ if __name__=='__main__':main()
 
 @@ABC_END
 
-@@ABC_FILE modules/report_store.py 600 d0950e10393fea84b4d128307437c964b8070c79e5a7d779b4f24d6787b71946
+@@ABC_FILE modules/report_store.py 600 e657d080490645ffe29ccc031d84e63b6dd288b27f1451b0e0ce002471f967d9
 """Offline immutable report exports. No overwrite/delete operation is exposed."""
 from contextlib import contextmanager,ExitStack
 from pathlib import Path
@@ -3410,7 +3410,7 @@ def report_body(model,kind):
         edges=[]
         if not isinstance(rows,list):raise ValueError('MySQL关系结构损坏')
         for e in rows:
-            if not isinstance(e,dict) or e.get(source_key) not in ('A','B','C','D') or e.get(target_key) not in ('A','B','C','D') or type(e.get('topology_version')) is not int or e['topology_version']<0:raise ValueError('MySQL关系字段非法')
+            if not isinstance(e,dict) or e.get(source_key) not in ('A','B','C','D') or e.get(target_key) not in ('A','B','C','D') or type(e.get('topology_version')) is not int or e['topology_version']!=model['version']:raise ValueError('MySQL关系字段或来源拓扑版本不一致')
             edges.append(dict(source_node=e[source_key],target_node=e[target_key],topology_version=e['topology_version'],replication_status='尚未验证',gtid_status='尚未检查'))
         return dict(primary=primary,mysql_replication=edges,status='未配置' if primary is None else '离线模型；尚未验证')
     if kind!='file-sync-report':raise ValueError('未知报告类型')
@@ -3420,8 +3420,8 @@ def report_body(model,kind):
         if not isinstance(e,dict) or e.get('source') not in ('A','B','C','D') or e.get('target') not in ('A','B','C','D'):raise ValueError('文件同步关系非法')
         edges.append(dict(source=e['source'],target=e['target'],status='尚未验证'))
     jobs=m['sync'].get('jobs')
-    if not isinstance(jobs,dict):raise ValueError('报告任务结构损坏')
-    return dict(primary=primary,file_sync=edges,status='未配置' if primary is None else '离线模型；尚未验证',sync_root='/home/web/',job_count=len(jobs))
+    if not isinstance(jobs,dict) or any(not isinstance(job,dict) for job in jobs.values()):raise ValueError('报告任务结构损坏')
+    return dict(primary=primary,file_sync=edges,status='离线模型；尚未验证' if edges or jobs else '未配置',sync_root='/home/web/',job_count=len(jobs))
 
 def content_valid(value):
     keys={'schema','mode','operation_id','kind','source','consistency','body'}
@@ -3433,17 +3433,18 @@ def content_valid(value):
     topology=value['kind']=='topology-report'
     keys={'primary','mysql_replication','status'} if topology else {'primary','file_sync','status','sync_root','job_count'}
     if not isinstance(body,dict) or set(body)!=keys or body['primary'] not in (None,'A','B','C','D'):raise ValueError('报告正文结构损坏')
-    if body['status']!=('未配置' if body['primary'] is None else '离线模型；尚未验证'):raise ValueError('报告状态损坏')
     rows=body['mysql_replication' if topology else 'file_sync']
     if not isinstance(rows,list):raise ValueError('报告关系不是列表')
     if not topology and (type(body['job_count']) is not int or body['job_count']<0 or body['sync_root']!='/home/web/'):raise ValueError('同步报告字段非法')
+    configured=(body['primary'] is not None) if topology else bool(rows or body['job_count'])
+    if body['status']!=('离线模型；尚未验证' if configured else '未配置'):raise ValueError('报告状态损坏')
     for edge in rows:
         expected={'source_node','target_node','topology_version','replication_status','gtid_status'} if topology else {'source','target','status'}
         if not isinstance(edge,dict) or set(edge)!=expected:raise ValueError('报告关系结构损坏')
         for key in ('source_node','target_node') if topology else ('source','target'):
             if edge[key] not in ('A','B','C','D'):raise ValueError('报告节点非法')
         if topology:
-            if type(edge['topology_version']) is not int or edge['topology_version']<0 or edge['replication_status']!='尚未验证' or edge['gtid_status']!='尚未检查':raise ValueError('MySQL关系状态非法')
+            if type(edge['topology_version']) is not int or edge['topology_version']!=value['source']['topology_version'] or edge['replication_status']!='尚未验证' or edge['gtid_status']!='尚未检查':raise ValueError('MySQL关系状态或来源版本非法')
         elif edge['status']!='尚未验证':raise ValueError('文件关系状态非法')
     return value
 
@@ -6582,7 +6583,7 @@ if __name__=='__main__':
 
 @@ABC_END
 
-@@ABC_FILE tests/test_report_projection.py 600 c4f8e8c50533a3300a4bb0eecb49471fea292c9939bf94d80a542f9842c0a3a5
+@@ABC_FILE tests/test_report_projection.py 600 b4e450b459c4bef06e0f1a2f374c48e1dd911de21e32e94bb63d940c358191ce
 """Report kind projection and PREPARED association checks."""
 import copy,json,unittest
 from unittest.mock import patch
@@ -6592,7 +6593,7 @@ from node_functions import initial
 
 class ProjectionTests(ReportTests):
  def test_distinct_mysql_and_file_relations(self):
-  model=initial();sample=dict(primary='D',database=[dict(source_node='D',target_node='A',topology_version=7,replication_status='offline',gtid_status='unknown',error='SECRET')],files=[dict(source='D',target='B',status='unknown',address='SECRET')])
+  model=initial();model['version']=7;sample=dict(primary='D',database=[dict(source_node='D',target_node='A',topology_version=7,replication_status='offline',gtid_status='unknown',error='SECRET')],files=[dict(source='D',target='B',status='unknown',address='SECRET')])
   with patch('report_store.channels',return_value=sample):
    top=report_body(model,'topology-report');files=report_body(model,'file-sync-report')
   self.assertEqual(top['mysql_replication'],[dict(source_node='D',target_node='A',topology_version=7,replication_status='尚未验证',gtid_status='尚未检查')]);self.assertNotIn('file_sync',top)
@@ -6619,6 +6620,61 @@ class ProjectionTests(ReportTests):
    s.write('transaction.json',bad);before=(s.folder/'transaction.json').read_bytes()
    with self.assertRaises(ValueError):s.recover()
    self.assertEqual(before,(s.folder/'transaction.json').read_bytes());self.assertFalse((s.folder/'report-crash.json').exists())
+ def test_file_status_independent_null_primary_three_jobs(self):
+  from management_model import defaults
+  model=initial();model['management']=defaults();model['management']['sync']['jobs']={str(i):{} for i in range(3)}
+  sample=dict(primary=None,database=[],files=[dict(source='D',target='B')])
+  with patch('report_store.channels',return_value=sample):
+   body=report_body(model,'file-sync-report')
+  self.assertIsNone(body['primary']);self.assertEqual(body['job_count'],3);self.assertEqual(body['status'],'离线模型；尚未验证');self.assertEqual(body['file_sync'],[dict(source='D',target='B',status='尚未验证')])
+  s=self.store();snapshot=s.source();snapshot['model']=model
+  snapshot['reference']['model_sha256']=sha(encode(model))
+  with patch.object(s,'source',return_value=snapshot),patch('report_store.channels',return_value=sample):
+   result=s.export('file-sync-report','nullprimary',0,snapshot['reference'])
+   content=s.read('report-nullprimary.json');content_valid(content)
+   self.assertEqual(content['body'],body)
+   self.assertEqual(result,s.export('file-sync-report','nullprimary',0,snapshot['reference']))
+   s.recover()
+ def test_file_status_relationship_task_matrix_and_invalid(self):
+  from management_model import defaults
+  for primary in (None,'A'):
+   for relation in (False,True):
+    for count in (0,3):
+     model=initial();model['management']=defaults();model['management']['sync']['jobs']={str(i):{} for i in range(count)}
+     sample=dict(primary=primary,database=[],files=[dict(source='D',target='B')] if relation else [])
+     with patch('report_store.channels',return_value=sample):body=report_body(model,'file-sync-report')
+     self.assertEqual(body['status'],'离线模型；尚未验证' if relation or count else '未配置');self.assertEqual(body['primary'],primary)
+     with patch('report_store.channels',return_value=sample):top=report_body(model,'topology-report')
+     self.assertEqual(top['mysql_replication'],[]);self.assertEqual(top['status'],'未配置' if primary is None else '离线模型；尚未验证')
+  for jobs in (None,[],3,{'broken':None}):
+   model['management']['sync']['jobs']=jobs
+   with self.assertRaises(ValueError):report_body(model,'file-sync-report')
+ def test_mysql_edge_version_matches_source_generation_and_validation(self):
+  model=initial();model['version']=5
+  for version in (4,6,-1,True):
+   sample=dict(primary='D',database=[dict(source_node='D',target_node='B',topology_version=version)],files=[])
+   with patch('report_store.channels',return_value=sample):
+    with self.assertRaises(ValueError):report_body(model,'topology-report')
+  s=self.store();result=self.export();content=s.read('report-one.json');content['body']=dict(primary='D',status='离线模型；尚未验证',mysql_replication=[dict(source_node='D',target_node='B',topology_version=9,replication_status='尚未验证',gtid_status='尚未检查')])
+  with self.assertRaises(ValueError):content_valid(content)
+ def test_ledger_versions_negative_boolean_jump_and_recovery(self):
+  self.export();s=self.store();valid=s.ledger()
+  for key in ('before_version','after_version'):
+   for value in (-1,True,False,5):
+    bad=copy.deepcopy(valid);bad['entries'][-1][key]=value
+    with self.assertRaises(ValueError):s.validate_ledger(bad)
+  for value in (-1,True,False,3):
+   bad=copy.deepcopy(valid);bad['version']=value
+   with self.assertRaises(ValueError):s.validate_ledger(bad)
+ def test_prepared_recovery_rejects_invalid_version_arithmetic(self):
+  # A fresh fixture reaches PREPARED at version zero, without prior exports.
+  self.kill('prepared');s=self.store();j=s.read('transaction.json')
+  for key in ('before_version','after_version'):
+   for value in (-1,True,False,5):
+    bad=copy.deepcopy(j);bad['after']['entries'][-1][key]=value;s.write('transaction.json',bad)
+    before=(s.folder/'transaction.json').read_bytes()
+    with self.assertRaises(ValueError):s.recover()
+    self.assertEqual(before,(s.folder/'transaction.json').read_bytes())
 
 if __name__=='__main__':
  r=unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(ProjectionTests(n) for n in ProjectionTests.__dict__ if n.startswith('test_')));raise SystemExit(not r.wasSuccessful())
