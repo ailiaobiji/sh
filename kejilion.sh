@@ -11292,15 +11292,11 @@ EOF
               case "${script_choice:-1}" in
                 1) echo '保留本地文件，继续检查定时任务。' ;;
                 2)
-                  IFS= read -r -p '确认覆盖本地清理规则？[y/N]：' update_confirm || exit 0
+                  IFS= read -r -p '确认使用远程文件覆盖本地清理规则？[y/N]：' update_confirm || exit 0
                   case "$update_confirm" in
                     [Yy]|[Yy][Ee][Ss])
-                      backup_script=$(mktemp '/home/备份/beifen.sh.before-update.XXXXXXXX') || exit 1
-                      if ! cp -p -- "$local_script" "$backup_script"; then
-                        echo '本地备份失败，取消更新。'; exit 1
-                      fi
                       chmod 700 "$tmp_script" && mv -f -- "$tmp_script" "$local_script" || exit 1
-                      echo "远程文件已更新；本地原文件备份：$backup_script（未执行清理）"
+                      echo '✅ 远程文件已更新，本地原文件未备份（未执行清理）。'
                       ;;
                     *) echo '已取消更新，继续使用本地文件。' ;;
                   esac
