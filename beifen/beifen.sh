@@ -36,6 +36,14 @@ cd /home/备份/nezhav0/ && ls -t *.tar.gz | tail -n +5 | xargs -I {} rm {}
 
 cd /home/备份/open-webui/ && ls -t *.tar.gz | tail -n +10 | xargs -I {} rm {}
 
+cd /home/备份/backrest/ && ls -t *.tar.gz | tail -n +10 | xargs -r -I {} rm -- {}
+
+cd /home/备份/无限流量爱马仕/ && ls -t *.tar.gz | tail -n +5 | xargs -r -I {} rm -- {}
+
+cd /home/备份/无限流量龙虾/ && ls -t *.tar.gz | tail -n +5 | xargs -r -I {} rm -- {}
+
+cd /home/备份/爱马仕小说/ && ls -t *.tar.gz | tail -n +5 | xargs -r -I {} rm -- {}
+
 
 
 
