@@ -3363,7 +3363,7 @@ if __name__=='__main__':main()
 
 @@ABC_END
 
-@@ABC_FILE modules/report_store.py 600 e657d080490645ffe29ccc031d84e63b6dd288b27f1451b0e0ce002471f967d9
+@@ABC_FILE modules/report_store.py 600 fceb89dfdbd20445ab6e63f77966440761e0c940c3db7cd985e5135dd242e197
 """Offline immutable report exports. No overwrite/delete operation is exposed."""
 from contextlib import contextmanager,ExitStack
 from pathlib import Path
@@ -3382,6 +3382,7 @@ from config_transaction import ConfigTransaction
 from domain_store import DomainStore
 from node_functions import Store as ModelStore,initial
 from management_model import channels,settings
+from pathlib import PurePosixPath
 
 KINDS=('topology-report','file-sync-report')
 def encode(value):return json.dumps(value,sort_keys=True,ensure_ascii=False,allow_nan=False,indent=2).encode()+b'\n'
@@ -3399,9 +3400,32 @@ def reference_valid(value):
         if not isinstance(value[k],str) or not re.fullmatch('[a-f0-9]{64}',value[k]):raise ValueError('报告来源摘要损坏')
     return value
 
+def valid_jobs(jobs,version):
+    if not isinstance(jobs,dict):raise ValueError('报告任务不是字典')
+    for name,job in jobs.items():
+        if not isinstance(name,str) or not name or len(name)>64 or any(ord(c)<32 or ord(c)==127 for c in name):raise ValueError('任务标识非法')
+        if not isinstance(job,dict) or set(job)!={'status','preview','progress','attempts','source_version','paused'}:raise ValueError('任务字段不完整')
+        if job['status']!='离线模型待执行' or type(job['progress']) is not int or job['progress']!=0 or type(job['attempts']) is not int or job['attempts']!=0 or type(job['paused']) is not bool:raise ValueError('任务状态非法')
+        if type(job['source_version']) is not int or not 0<=job['source_version']<=version:raise ValueError('任务来源版本非法')
+        p=job['preview']
+        if not isinstance(p,dict) or set(p)!={'mode','files','deletions','executed'} or p['mode']!='OFFLINE_MODEL' or p['executed'] is not False or not isinstance(p['files'],list) or not isinstance(p['deletions'],list):raise ValueError('任务预览损坏')
+        def path_ok(v):
+            return isinstance(v,str) and v.startswith('/home/web/') and '..' not in PurePosixPath(v).parts and not any(v==x or v.startswith(x+'/') for x in ('/home/web/log','/home/web/mysql','/home/web/redis'))
+        for f in p['files']:
+            if not isinstance(f,dict) or set(f)!={'path','transfer','retry','resume'} or not path_ok(f['path']) or f['transfer']!='临时文件→完整性校验→原子替换' or f['resume']!='校验源版本，源变化补跑；周期扫描补偿' or type(f['retry']) is not int or not 1<=f['retry']<=100:raise ValueError('任务文件预览损坏')
+        if any(not path_ok(v) for v in p['deletions']):raise ValueError('任务删除预览损坏')
+    return len(jobs)
+
+def captured_valid(captured):
+    if not isinstance(captured,dict) or set(captured)!={'model','reference'}:raise ValueError('来源捕获损坏')
+    model=captured['model'];ref=reference_valid(captured['reference'])
+    if not isinstance(model,dict) or type(model.get('version')) is not int or model['version']<0 or model['version']!=ref['topology_version'] or model.get('domain_versions')!=ref['domain_versions'] or sha(encode(model))!=ref['model_sha256']:raise ValueError('来源模型版本或摘要不一致')
+    return captured
+
 def report_body(model,kind):
     # Never serialize arbitrary templates, file names, SSH addresses or nested
     # model extensions. Values under innocuous keys can also carry credentials.
+    if not isinstance(model,dict) or type(model.get('version')) is not int or model['version']<0:raise ValueError('模型版本非法')
     c=channels(model);m=settings(model)
     primary=c['primary']
     if primary not in (None,'A','B','C','D'):raise ValueError('报告主节点非法')
@@ -3420,7 +3444,7 @@ def report_body(model,kind):
         if not isinstance(e,dict) or e.get('source') not in ('A','B','C','D') or e.get('target') not in ('A','B','C','D'):raise ValueError('文件同步关系非法')
         edges.append(dict(source=e['source'],target=e['target'],status='尚未验证'))
     jobs=m['sync'].get('jobs')
-    if not isinstance(jobs,dict) or any(not isinstance(job,dict) for job in jobs.values()):raise ValueError('报告任务结构损坏')
+    valid_jobs(jobs,model['version'])
     return dict(primary=primary,file_sync=edges,status='离线模型；尚未验证' if edges or jobs else '未配置',sync_root='/home/web/',job_count=len(jobs))
 
 def content_valid(value):
@@ -3509,7 +3533,7 @@ class ReportStore(PrivateIO):
         p=self.folder/'audit.json';d=self.read(p.name) if p.exists() or p.is_symlink() else dict(schema=1,version=0,entries=[])
         return self.validate_ledger(d)
     def validate_ledger(self,d):
-        if not isinstance(d,dict) or set(d)!={'schema','version','entries'} or d['schema']!=1 or type(d['version']) is not int or d['version']<0 or not isinstance(d['entries'],list) or len(d['entries'])!=d['version']:raise ValueError('报告审计结构损坏')
+        if not isinstance(d,dict) or set(d)!={'schema','version','entries'} or type(d['schema']) is not int or d['schema']!=1 or type(d['version']) is not int or d['version']<0 or not isinstance(d['entries'],list) or len(d['entries'])!=d['version']:raise ValueError('报告审计结构损坏')
         ids=[]
         for i,e in enumerate(d['entries'],1):
             if not isinstance(e,dict) or set(e)!={'operation_id','fingerprint','filename','sha256','timestamp','source','before_version','after_version','result','reason'} or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',e.get('operation_id','')) or e['filename']!='report-'+e['operation_id']+'.json' or e['before_version']!=i-1 or e['after_version']!=i or e['result']!='COMMITTED' or e['reason'] is not None or not isinstance(e['source'],dict):raise ValueError('报告审计记录损坏')
@@ -3566,6 +3590,9 @@ class ReportStore(PrivateIO):
             if not isinstance(j[key],str) or not re.fullmatch('[a-f0-9]{64}',j[key]):raise ValueError('报告事务摘要类型损坏')
         content_valid(j['content'])
         after=self.validate_ledger(j['after']);current=self.ledger()
+        prefix=dict(schema=1,version=after['version']-1,entries=after['entries'][:-1])
+        if sha(encode(prefix))!=j['before_sha256']:raise ValueError('恢复历史前缀摘要不一致')
+        for prior in after['entries'][:-1]:self.validate_existing(prior)
         if current!=after and (sha(encode(current))!=j['before_sha256'] or after['version']!=current['version']+1 or after['entries'][:-1]!=current['entries']):raise ValueError('报告审计已有新版本，恢复拒绝覆盖')
         if not after['entries']:raise ValueError('恢复审计为空')
         entry=after['entries'][-1];content=encode(j['content'])
@@ -3597,17 +3624,17 @@ class ReportStore(PrivateIO):
             self._recover();old=self.ledger();prior=next((e for e in old['entries'] if e['operation_id']==operation_id),None)
             if prior:
                 if prior['fingerprint']!=fp:raise ValueError('报告operation_id请求冲突')
-                p=self.folder/prior['filename'];self.private(p)
-                if sha(p.read_bytes())!=prior['sha256']:raise ValueError('已提交报告被修改，拒绝幂等成功')
+                self.validate_existing(prior)
+                p=self.folder/prior['filename']
                 return dict(path=str(p),status='COMMITTED',version=prior['after_version'])
             if old['version']!=expected:raise ValueError('报告CAS版本冲突')
-            captured=self.source()
+            captured=captured_valid(self.source())
             if captured['reference']!=reference:raise ValueError('来源配置/拓扑/审计版本已变化')
             model=captured['model']
             content=dict(schema=1,mode='OFFLINE_REPORT',operation_id=operation_id,kind=kind,source=reference,consistency='本机乐观版本核对；非分布式或生产一致性证明',body=report_body(model,kind))
             content_valid(content)
             # Check the model/config pair again. Historical bytes stay immutable.
-            if self.source()['reference']!=reference:raise ValueError('生成期间来源变化，拒绝混合快照')
+            if captured_valid(self.source())['reference']!=reference:raise ValueError('生成期间来源变化，拒绝混合快照')
             filename='report-'+operation_id+'.json';p=self.folder/filename
             if p.exists() or p.is_symlink():raise ValueError('报告路径已占用，禁止覆盖')
             new=copy.deepcopy(old);new['version']+=1
@@ -6583,13 +6610,18 @@ if __name__=='__main__':
 
 @@ABC_END
 
-@@ABC_FILE tests/test_report_projection.py 600 b4e450b459c4bef06e0f1a2f374c48e1dd911de21e32e94bb63d940c358191ce
+@@ABC_FILE tests/test_report_projection.py 600 aecf4b65186c2654749684af1cf7201f3d0977ea55f15139f74282e860c692a6
 """Report kind projection and PREPARED association checks."""
 import copy,json,unittest
 from unittest.mock import patch
 from test_report_transactions import ReportTests
 from report_store import encode,sha,report_body,content_valid
 from node_functions import initial
+
+def normal_job():
+ from management_model import defaults,sync_preview
+ sync=defaults()['sync'];sync['redis_usage']='CACHE'
+ return dict(status='离线模型待执行',preview=sync_preview(sync,{'files':[dict(path='/home/web/beifen/test',stable=True,quiet_seconds=5)]}),progress=0,attempts=0,source_version=0,paused=False)
 
 class ProjectionTests(ReportTests):
  def test_distinct_mysql_and_file_relations(self):
@@ -6622,7 +6654,7 @@ class ProjectionTests(ReportTests):
    self.assertEqual(before,(s.folder/'transaction.json').read_bytes());self.assertFalse((s.folder/'report-crash.json').exists())
  def test_file_status_independent_null_primary_three_jobs(self):
   from management_model import defaults
-  model=initial();model['management']=defaults();model['management']['sync']['jobs']={str(i):{} for i in range(3)}
+  model=initial();model['management']=defaults();model['management']['sync']['jobs']={str(i):normal_job() for i in range(3)}
   sample=dict(primary=None,database=[],files=[dict(source='D',target='B')])
   with patch('report_store.channels',return_value=sample):
    body=report_body(model,'file-sync-report')
@@ -6640,7 +6672,7 @@ class ProjectionTests(ReportTests):
   for primary in (None,'A'):
    for relation in (False,True):
     for count in (0,3):
-     model=initial();model['management']=defaults();model['management']['sync']['jobs']={str(i):{} for i in range(count)}
+     model=initial();model['management']=defaults();model['management']['sync']['jobs']={str(i):normal_job() for i in range(count)}
      sample=dict(primary=primary,database=[],files=[dict(source='D',target='B')] if relation else [])
      with patch('report_store.channels',return_value=sample):body=report_body(model,'file-sync-report')
      self.assertEqual(body['status'],'离线模型；尚未验证' if relation or count else '未配置');self.assertEqual(body['primary'],primary)
@@ -6676,12 +6708,53 @@ class ProjectionTests(ReportTests):
     with self.assertRaises(ValueError):s.recover()
     self.assertEqual(before,(s.folder/'transaction.json').read_bytes())
 
+ def test_task_schema_normal_empty_missing_types_nested(self):
+  from report_store import valid_jobs
+  job=normal_job();self.assertEqual(valid_jobs({'ok':job},0),1);self.assertEqual(valid_jobs({},0),0)
+  variants=[{},None,[]]
+  variants.extend({k:v for k,v in job.items() if k!=missing} for missing in job)
+  for key,value in [('progress',True),('paused',0),('attempts',-1),('source_version',True),('preview',[]),('status','done')]:
+   bad=copy.deepcopy(job);bad[key]=value;variants.append(bad)
+  bad=copy.deepcopy(job);bad['preview']['files']=[{}];variants.append(bad)
+  bad=copy.deepcopy(job);bad['preview']['deletions']=[{}];variants.append(bad)
+  for bad in variants:
+   with self.assertRaises(ValueError):valid_jobs({'bad':bad},0)
+ def test_captured_model_source_digest_and_versions_generation(self):
+  s=self.store();original=s.source()
+  for value in (None,-1,True,8):
+   bad=copy.deepcopy(original);bad['model']['version']=value
+   with patch.object(s,'source',return_value=bad):
+    with self.assertRaises(ValueError):s.export('topology-report','badversion',0,bad['reference'])
+  bad=copy.deepcopy(original);bad['reference']['model_sha256']='0'*64
+  with patch.object(s,'source',return_value=bad):
+   with self.assertRaises(ValueError):s.export('topology-report','baddigest',0,bad['reference'])
+  self.assertFalse((s.folder/'transaction.json').exists())
+ def test_source_tamper_content_digest_only_replay_refused(self):
+  self.export();s=self.store();report=s.read('report-one.json');audit=s.ledger();ref=copy.deepcopy(report['source'])
+  report['source']['topology_version']=99;report['source']['model_sha256']='1'*64
+  s.write('report-one.json',report);audit['entries'][0]['sha256']=sha(encode(report));s.write('audit.json',audit)
+  before={name:(s.folder/name).read_bytes() for name in ('report-one.json','audit.json','transaction.json')}
+  with self.assertRaises(ValueError):s.request_versions('topology-report','one')
+  with self.assertRaises(ValueError):s.export('topology-report','one',0,ref)
+  for name,data in before.items():self.assertEqual((s.folder/name).read_bytes(),data)
+ def test_recovery_source_tamper_digest_only_refused(self):
+  self.kill('prepared');s=self.store();j=s.read('transaction.json')
+  j['content']['source']['topology_version']=12;j['content_sha256']=sha(encode(j['content']));j['after']['entries'][-1]['sha256']=j['content_sha256'];s.write('transaction.json',j)
+  before=(s.folder/'transaction.json').read_bytes()
+  with self.assertRaises(ValueError):s.recover()
+  self.assertEqual((s.folder/'transaction.json').read_bytes(),before);self.assertFalse((s.folder/'audit.json').exists())
+ def test_audit_published_recovery_prefix_digest_refused(self):
+  self.kill('audit');s=self.store();j=s.read('transaction.json');j['before_sha256']='0'*64;s.write('transaction.json',j)
+  before={name:(s.folder/name).read_bytes() for name in ('transaction.json','audit.json','report-crash.json')}
+  with self.assertRaises(ValueError):s.recover()
+  for name,data in before.items():self.assertEqual((s.folder/name).read_bytes(),data)
+
 if __name__=='__main__':
  r=unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(ProjectionTests(n) for n in ProjectionTests.__dict__ if n.startswith('test_')));raise SystemExit(not r.wasSuccessful())
 
 @@ABC_END
 
-@@ABC_FILE tests/test_report_safety.py 600 988895daa78171112df4b83ca592775c1b08ec8a3fb08506876c1bb0a80dcb74
+@@ABC_FILE tests/test_report_safety.py 600 704ffd766112a60b644dac172309724612badc07260c2ed1107a4ce589dfce43
 """Malformed input and credential containment, external report fixtures."""
 import copy,json,sys,unittest
 from unittest.mock import patch
@@ -6725,7 +6798,9 @@ class SafetyTests(ReportTests):
   model=initial();model['management']=defaults();m=model['management']
   sentinels=['fake-PASSWORD-abc','fake-TOKEN-xyz','fake-PRIVATE-KEY','vault:AUTH-SENTINEL']
   m['mysql_config']['public']={'description':sentinels[0],'deep':[{'value':sentinels[1]}]};m['mysql_config']['sensitive_ref']=sentinels[3]
-  m['ssh']={'A':{'address':sentinels[2],'auth_ref':sentinels[3]}};m['sync']['jobs']={'innocent':{'details':sentinels}}
+  m['ssh']={'A':{'address':sentinels[2],'auth_ref':sentinels[3]}}
+  from test_report_projection import normal_job
+  m['sync']['jobs']={'innocent':normal_job()};m['sync']['jobs']['innocent']['preview']['files'][0]['path']='/home/web/'+sentinels[0]
   s=self.store();source=s.source();source['model']=model;source['reference']['model_sha256']=sha(encode(model))
   with patch.object(s,'source',return_value=source):
    result=s.export('file-sync-report','secrets',0,source['reference'])
