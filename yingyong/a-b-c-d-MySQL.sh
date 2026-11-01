@@ -21,10 +21,30 @@ if (( ${#missing[@]} )); then
     for arg in "$@"; do
         [[ $arg != --dry-run ]] || { printf 'Dry-run：不安装依赖。\n'; exit 1; }
     done
-    printf '允许安装运行依赖 python3/util-linux/coreutils？输入小写 yes：'
+    packages=()
+    for cmd in "${missing[@]}"; do
+        case "$cmd" in
+            python3) package=python3; reason='离线菜单、JSON校验及本地事务运行时' ;;
+            flock) package=util-linux; reason='本地并发操作锁' ;;
+            sha256sum|stat) package=coreutils; reason='文件摘要、权限与完整性检查' ;;
+            bash) package=bash; reason='程序Shell入口' ;;
+        esac
+        printf '缺少 %s：%s；对应软件包 %s。\n' "$cmd" "$reason" "$package"
+        [[ " ${packages[*]} " == *" $package "* ]] || packages+=("$package")
+    done
+    printf '仅补装缺失的基础运行依赖，不安装MySQL/SSH/Rsync或监控服务。\n'
+    printf '计划：apt-get update；apt-get install -y --no-install-recommends %s\n' "${packages[*]}"
+    printf '允许执行上述基础依赖安装？输入精确小写 yes：'
     IFS= read -r answer || exit 1
-    [[ $answer == yes ]] || exit 1
-    apt-get update && apt-get install -y --no-install-recommends python3 util-linux coreutils || exit 1
+    [[ $answer == yes ]] || { printf '已取消依赖安装，未修改系统。\n'; exit 1; }
+    command -v apt-get >/dev/null 2>&1 || { printf '缺少apt-get，无法安装，未启用任何功能。\n' >&2; exit 1; }
+    if ! apt-get update || ! apt-get install -y --no-install-recommends "${packages[@]}"; then
+        printf '基础依赖安装失败，未启用任何功能；已安装的部分包不会自动回滚。\n' >&2
+        exit 1
+    fi
+    for cmd in "${missing[@]}"; do
+        command -v "$cmd" >/dev/null 2>&1 || { printf '安装后仍缺少 %s，安全退出。\n' "$cmd" >&2; exit 1; }
+    done
 fi
 printf '系统检测：%s %s；root 权限及必要工具可用。\n' "$ID" "$VERSION_ID"
 # FD 3 保留交互输入，Python 源码来自 heredoc。
@@ -885,6 +905,34 @@ monitor_evaluate要求旧不可用明确模拟证据，候选按B,D选，有独�
 菜单11→12提供策略查看/修改和低层JSON离线场景提交。生产/监控分别配置，资源阈值编辑仍不完整（沿用模型阈值和allow_colocation），不是完整迁移期限向导或后台调度器。本轮没有后台任务自动到期执行，必须显式离线评估。
 
 新增5项测试包含A→B/D临时、D永久、重载/幂等、血缘/追平/Fencing/文件拒绝、优先级重算、每个生产恢复阶段prepared/published交替中断、监控B/D/降级候选、schema3发布后恢复及旧模型写阻断。永久到B、真实多进程竞争、监控每阶段恢复/独立锁任期/完整C恢复交还尚未新增专测；不将已有模拟结果扩写为24场景全部通过。
+
+@@ABC_END
+
+@@ABC_FILE docs/ON-DEMAND-DEPENDENCIES.md 600 0d66b470e7d3122162b8f0d6d6290231d41e612ebf1cac41f8acf43f84041fb8
+# 阶段二按需依赖合同
+
+基础启动依赖：Bash、Python3标准库（离线菜单/JSON/本地事务）、util-linux的flock（本地锁）、coreutils（readlink/stat/sha256sum及文件操作）。不需要pip、第三方Python包、MySQL客户端/服务端、SSH或Rsync。启动器仅对实际缺失工具映射的软件包去重，显示用途及apt命令，精确yes后才补装；拒绝/EOF/dry-run不安装。安装失败或安装后工具仍缺失安全退出，不启用服务；包管理器部分执行不保证回滚。
+
+## 菜单依赖逐项
+1 Cloudflare配置：仅基础依赖；格式检查/事务，不调用API、curl或DNS。
+2 节点登记备注：仅基础依赖，不安装节点软件。
+3 生产绑定：仅基础依赖，本地资格配置，不安装MySQL或其他服务。
+4 监控绑定：仅基础依赖，离线环境资料/清单/计划，不自动安装任何远端环境。
+5 MySQL通信配置：仅基础依赖；不安装MySQL、WireGuard或复制服务。
+6 动态拓扑：仅基础依赖，离线模型与报告，不安装/启动MySQL。
+7 SSH/Rsync配置与报告：仅基础依赖；未启用真实传输，不补装或启动SSH/Rsync。
+8 环境检查：基础依赖+读取本机/etc/os-release、/proc及磁盘信息；缺失的监控依赖只进入离线清单/计划。原冻结功能定义不含真实远程安装，确认仅提交离线模型/模拟结果，不能解释为安装授权。
+9 手动迁移：仅基础依赖，本地模型，不停写/切换/启服务。
+10 自动迁移：仅基础依赖，持久化离线状态机，无生产后台执行器。
+
+## 可选组件与启用门禁
+未来真实功能可能需要MySQL/MariaDB、openssh-client、rsync等，但阶段二真实执行未启用，不提供可选组件的实际安装或服务启用入口。进入菜单不按编号拼装安装清单。已有组件由只读检查识别，不重复安装；组件可用不表示功能启用。需要改变第8项冻结定义为真实安装时必须单独批准。
+
+基础依赖以后缺失，重启单文件即可单独确认补装缺失包，无须重新初始化项目。基础依赖检查、apt安装和项目初始化为不同确认步骤。已有config/state/report不会因启动被初始化覆盖。只打开已经安装项目的菜单不改系统包/服务/配置；首次项目初始化只有明确确认后写项目程序与初始配置，不是系统服务安装。
+
+安装命令只在外层启动器的缺失基础依赖分支。菜单1—10无apt或服务启用调用。保留的旧monitor CLI真实采集/服务入口不属于正式离线菜单且本次不执行、不扩展。
+
+测试必须分别记录：全新镜像→拒绝安装（无变化）；确认安装基础依赖（含其包依赖变化）；基础齐全后首次项目初始化；菜单3—7和重启（无包/服务/配置变化）。容器只证明userspace，不能证明systemd真实运行或VM开机行为。
 
 @@ABC_END
 
