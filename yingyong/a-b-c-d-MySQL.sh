@@ -3363,7 +3363,7 @@ if __name__=='__main__':main()
 
 @@ABC_END
 
-@@ABC_FILE modules/report_store.py 600 774bb0f983496ca69d8658b2869732dd6b8dfeae779da79086c8604e07cdb304
+@@ABC_FILE modules/report_store.py 600 d0950e10393fea84b4d128307437c964b8070c79e5a7d779b4f24d6787b71946
 """Offline immutable report exports. No overwrite/delete operation is exposed."""
 from contextlib import contextmanager,ExitStack
 from pathlib import Path
@@ -3405,13 +3405,23 @@ def report_body(model,kind):
     c=channels(model);m=settings(model)
     primary=c['primary']
     if primary not in (None,'A','B','C','D'):raise ValueError('报告主节点非法')
-    edges=[]
-    for e in c['files']:
-        if not isinstance(e,dict) or e.get('source') not in ('A','B','C','D') or e.get('target') not in ('A','B','C','D'):raise ValueError('报告复制边非法')
-        edges.append([e['source'],e['target']])
+    if kind=='topology-report':
+        rows=c['database'];source_key='source_node';target_key='target_node'
+        edges=[]
+        if not isinstance(rows,list):raise ValueError('MySQL关系结构损坏')
+        for e in rows:
+            if not isinstance(e,dict) or e.get(source_key) not in ('A','B','C','D') or e.get(target_key) not in ('A','B','C','D') or type(e.get('topology_version')) is not int or e['topology_version']<0:raise ValueError('MySQL关系字段非法')
+            edges.append(dict(source_node=e[source_key],target_node=e[target_key],topology_version=e['topology_version'],replication_status='尚未验证',gtid_status='尚未检查'))
+        return dict(primary=primary,mysql_replication=edges,status='未配置' if primary is None else '离线模型；尚未验证')
+    if kind!='file-sync-report':raise ValueError('未知报告类型')
+    rows=c['files'];edges=[]
+    if not isinstance(rows,list):raise ValueError('文件同步关系结构损坏')
+    for e in rows:
+        if not isinstance(e,dict) or e.get('source') not in ('A','B','C','D') or e.get('target') not in ('A','B','C','D'):raise ValueError('文件同步关系非法')
+        edges.append(dict(source=e['source'],target=e['target'],status='尚未验证'))
     jobs=m['sync'].get('jobs')
     if not isinstance(jobs,dict):raise ValueError('报告任务结构损坏')
-    return dict(primary=primary,edges=edges,channel_status={'mysql':'尚未检查','files':'尚未检查','mysql_config':'尚未检查'},sync_root='/home/web/',job_count=len(jobs),details='自由文本、路径清单、连接资料和配置模板不导出')
+    return dict(primary=primary,file_sync=edges,status='未配置' if primary is None else '离线模型；尚未验证',sync_root='/home/web/',job_count=len(jobs))
 
 def content_valid(value):
     keys={'schema','mode','operation_id','kind','source','consistency','body'}
@@ -3420,12 +3430,21 @@ def content_valid(value):
     reference_valid(value['source'])
     if value['consistency']!='本机乐观版本核对；非分布式或生产一致性证明':raise ValueError('报告一致性声明损坏')
     body=value['body']
-    if not isinstance(body,dict) or set(body)!={'primary','edges','channel_status','sync_root','job_count','details'}:raise ValueError('报告正文结构损坏')
-    if body['primary'] not in (None,'A','B','C','D') or type(body['job_count']) is not int or body['job_count']<0 or body['sync_root']!='/home/web/' or body['details']!='自由文本、路径清单、连接资料和配置模板不导出':raise ValueError('报告正文值损坏')
-    if body['channel_status']!={'mysql':'尚未检查','files':'尚未检查','mysql_config':'尚未检查'}:raise ValueError('报告通道状态损坏')
-    if not isinstance(body['edges'],list):raise ValueError('报告边不是列表')
-    for edge in body['edges']:
-        if not isinstance(edge,list) or len(edge)!=2 or any(not isinstance(n,str) or n not in ('A','B','C','D') for n in edge):raise ValueError('报告边结构损坏')
+    topology=value['kind']=='topology-report'
+    keys={'primary','mysql_replication','status'} if topology else {'primary','file_sync','status','sync_root','job_count'}
+    if not isinstance(body,dict) or set(body)!=keys or body['primary'] not in (None,'A','B','C','D'):raise ValueError('报告正文结构损坏')
+    if body['status']!=('未配置' if body['primary'] is None else '离线模型；尚未验证'):raise ValueError('报告状态损坏')
+    rows=body['mysql_replication' if topology else 'file_sync']
+    if not isinstance(rows,list):raise ValueError('报告关系不是列表')
+    if not topology and (type(body['job_count']) is not int or body['job_count']<0 or body['sync_root']!='/home/web/'):raise ValueError('同步报告字段非法')
+    for edge in rows:
+        expected={'source_node','target_node','topology_version','replication_status','gtid_status'} if topology else {'source','target','status'}
+        if not isinstance(edge,dict) or set(edge)!=expected:raise ValueError('报告关系结构损坏')
+        for key in ('source_node','target_node') if topology else ('source','target'):
+            if edge[key] not in ('A','B','C','D'):raise ValueError('报告节点非法')
+        if topology:
+            if type(edge['topology_version']) is not int or edge['topology_version']<0 or edge['replication_status']!='尚未验证' or edge['gtid_status']!='尚未检查':raise ValueError('MySQL关系状态非法')
+        elif edge['status']!='尚未验证':raise ValueError('文件关系状态非法')
     return value
 
 class FailureAuditError(ValueError):
@@ -3550,6 +3569,7 @@ class ReportStore(PrivateIO):
         if not after['entries']:raise ValueError('恢复审计为空')
         entry=after['entries'][-1];content=encode(j['content'])
         if sha(content)!=j['content_sha256'] or entry['sha256']!=sha(content) or j['content'].get('operation_id')!=entry['operation_id'] or j['content'].get('source')!=entry['source']:raise ValueError('报告恢复内容损坏')
+        self.match_entry(j['content'],entry)
         self.publish(entry['filename'],content)
         self.write('audit.json',after)
         self.write('transaction.json',dict(status='COMMITTED',version=after['version']))
@@ -3599,7 +3619,11 @@ class ReportStore(PrivateIO):
         if sha(p.read_bytes())!=entry['sha256']:raise ValueError('报告审计摘要不匹配')
         body=content_valid(self.read(p.name))
         if body['operation_id']!=entry['operation_id'] or body['source']!=entry['source']:raise ValueError('报告身份/来源与审计不一致')
+        self.match_entry(body,entry)
         return body
+    def match_entry(self,content,entry):
+        expected=sha(encode(dict(kind=content['kind'],operation_id=content['operation_id'],expected=entry['before_version'],reference=content['source'])))
+        if entry['filename']!='report-'+content['operation_id']+'.json' or entry['fingerprint']!=expected:raise ValueError('报告种类/文件名与审计请求关联不一致')
 
 if __name__=='__main__':
     import sys
@@ -6555,6 +6579,49 @@ class RenameTests(FrameworkTests):
 if __name__=='__main__':
  suite=unittest.TestSuite(RenameTests(n) for n in RenameTests.__dict__ if n.startswith('test_'))
  result=unittest.TextTestRunner(verbosity=2).run(suite);raise SystemExit(not result.wasSuccessful())
+
+@@ABC_END
+
+@@ABC_FILE tests/test_report_projection.py 600 c4f8e8c50533a3300a4bb0eecb49471fea292c9939bf94d80a542f9842c0a3a5
+"""Report kind projection and PREPARED association checks."""
+import copy,json,unittest
+from unittest.mock import patch
+from test_report_transactions import ReportTests
+from report_store import encode,sha,report_body,content_valid
+from node_functions import initial
+
+class ProjectionTests(ReportTests):
+ def test_distinct_mysql_and_file_relations(self):
+  model=initial();sample=dict(primary='D',database=[dict(source_node='D',target_node='A',topology_version=7,replication_status='offline',gtid_status='unknown',error='SECRET')],files=[dict(source='D',target='B',status='unknown',address='SECRET')])
+  with patch('report_store.channels',return_value=sample):
+   top=report_body(model,'topology-report');files=report_body(model,'file-sync-report')
+  self.assertEqual(top['mysql_replication'],[dict(source_node='D',target_node='A',topology_version=7,replication_status='尚未验证',gtid_status='尚未检查')]);self.assertNotIn('file_sync',top)
+  self.assertEqual(files['file_sync'],[dict(source='D',target='B',status='尚未验证')]);self.assertNotIn('mysql_replication',files);self.assertNotIn('SECRET',json.dumps([top,files]))
+ def test_both_types_actual_readback_and_idempotent(self):
+  for index,kind in enumerate(('topology-report','file-sync-report')):
+   s=self.store();ref=s.source()['reference'];result=s.export(kind,'typed'+str(index),index,ref);body=s.read('report-typed'+str(index)+'.json');content_valid(body);self.assertEqual(body['kind'],kind)
+   self.assertIn('mysql_replication' if index==0 else 'file_sync',body['body']);self.assertEqual(body['body']['status'],'未配置');self.assertIsNone(body['body']['primary']);self.assertEqual(result,s.export(kind,'typed'+str(index),index,ref));s.recover()
+ def test_recovery_kind_association_even_if_content_digest_updated(self):
+  self.kill('prepared');s=self.store();j=s.read('transaction.json');original=copy.deepcopy(j)
+  # A coherent but different report kind must not match the original request FP.
+  from node_functions import initial
+  j['content']['kind']='file-sync-report';j['content']['body']=report_body(initial(),'file-sync-report');j['content_sha256']=sha(encode(j['content']));j['after']['entries'][-1]['sha256']=j['content_sha256'];s.write('transaction.json',j);before=(s.folder/'transaction.json').read_bytes()
+  with self.assertRaises(ValueError):s.recover()
+  self.assertEqual(before,(s.folder/'transaction.json').read_bytes());self.assertFalse((s.folder/'report-crash.json').exists());self.assertFalse((s.folder/'audit.json').exists())
+ def test_recovery_digest_version_filename_associations(self):
+  self.kill('prepared');s=self.store();j=s.read('transaction.json')
+  variants=[]
+  b=copy.deepcopy(j);b['content_sha256']='0'*64;variants.append(b)
+  b=copy.deepcopy(j);b['after']['entries'][-1]['filename']='report-other.json';variants.append(b)
+  b=copy.deepcopy(j);b['after']['entries'][-1]['after_version']=2;variants.append(b)
+  b=copy.deepcopy(j);b['after']['entries'][-1]['source']['config_version']=9;variants.append(b)
+  for bad in variants:
+   s.write('transaction.json',bad);before=(s.folder/'transaction.json').read_bytes()
+   with self.assertRaises(ValueError):s.recover()
+   self.assertEqual(before,(s.folder/'transaction.json').read_bytes());self.assertFalse((s.folder/'report-crash.json').exists())
+
+if __name__=='__main__':
+ r=unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(ProjectionTests(n) for n in ProjectionTests.__dict__ if n.startswith('test_')));raise SystemExit(not r.wasSuccessful())
 
 @@ABC_END
 
