@@ -888,7 +888,7 @@ monitor_evaluate要求旧不可用明确模拟证据，候选按B,D选，有独�
 
 @@ABC_END
 
-@@ABC_FILE docs/REPORT-TRANSACTIONS.md 600 2f1c17524b372fbb85743d7018c0996b78a1dcd699f664ccd4273fc4b262ac6b
+@@ABC_FILE docs/REPORT-TRANSACTIONS.md 600 83352f3528f76a0d13d2d9a6b73509a9c9d1990e0ed29b1756dac8c6d31f55dd
 # 第三项：报告导出事务与边界
 
 ## 接口及目录
@@ -896,7 +896,7 @@ monitor_evaluate要求旧不可用明确模拟证据，候选按B,D选，有独�
 
 新文件置于动态项目根reports/，0700目录、0600文件；独立export.lock、audit.json、transaction.json。报告名report-<operation_id>.json，可重复查询同请求，禁止覆盖/删除功能；旧data目录报告不迁移、不清理。公共recover()及python3 -B modules/report_store.py --recover只处理本地历史报告意图，不触发生产或来源配置恢复。
 
-报告审计记录时间、operation_id、前后报告版本、来源配置/审计/模型摘要、结果与原因字段。成功只有COMMITTED；写文件/审计失败抛错保留PREPARED，不显示整个事务成功。失败原因目前由调用方错误输出，尚未形成独立持久化失败审计事件；这是明确缺口。
+报告审计记录时间、operation_id、前后报告版本、来源配置/审计/模型摘要、结果与原因字段。成功只有COMMITTED；写文件/审计失败抛错保留PREPARED，不显示整个事务成功。失败操作另存reports/failure-audit/failure-<随机事件ID>.json，逐事件排他发布、0600、不覆盖不轮转；只含固定原因代码/errno，不写异常原文或凭据。失败事件不增加成功报告版本，相同失败请求的多次尝试分别记录。若磁盘/权限使失败审计也无法落盘，显式FailureAuditError双重失败，绝不报成功；不能承诺磁盘不可写时仍能持久化。SIGKILL无法运行异常处理，依靠PREPARED检查点和恢复记录识别中断，不伪造已捕获失败事件。
 
 ## 事务
 源获取复用已验收ConfigTransaction.snapshot与ModelStore resolver（不改第一二项核心）。两次源摘要/版本核对检查生成期间变化，并在正文写清本机乐观版本核对，不宣称分布式/全局同步时刻。配置包含敏感值时仅保留摘要/版本，正文仅含脱敏报告字段，不包含配置原文。
@@ -3315,7 +3315,7 @@ if __name__=='__main__':main()
 
 @@ABC_END
 
-@@ABC_FILE modules/report_store.py 600 d132cb45adff3220a51b1bfbe1c963f3e75463d4c26d46203e8269047c2fbe54
+@@ABC_FILE modules/report_store.py 600 4eeff9b225b9a6a5a7a8ca19b5329ad51849712f764d39b0bb3e7acccc8cf52d
 """Offline immutable report exports. No overwrite/delete operation is exposed."""
 from contextlib import contextmanager,ExitStack
 from pathlib import Path
@@ -3327,6 +3327,8 @@ import os
 import re
 import tempfile
 import time
+import secrets
+from functools import wraps
 from topology_model import Store as PrivateIO
 from config_transaction import ConfigTransaction
 from domain_store import DomainStore
@@ -3342,11 +3344,36 @@ def safe(value):
     if isinstance(value,list):return [safe(v) for v in value]
     return value
 
+class FailureAuditError(ValueError):
+    """The original operation failed and its failure audit could not be saved."""
+
+def audited_failure(action):
+    def decorate(method):
+        @wraps(method)
+        def call(self,*args,**kwargs):
+            try:return method(self,*args,**kwargs)
+            except (ValueError,OSError,KeyError,TypeError) as error:
+                request=(kwargs.get('operation_id') or kwargs.get('request') or (args[1] if action in ('EXPORT','PREVIEW') and len(args)>1 else None))
+                try:self.failure_event(action,request,error)
+                except (ValueError,OSError,KeyError,TypeError) as audit_error:
+                    raise FailureAuditError('报告操作失败，且失败审计无法持久化；保留现场，禁止报告成功') from audit_error
+                raise
+        return call
+    return decorate
+
 class ReportStore(PrivateIO):
     def __init__(self,root):
         super().__init__(root);self.folder=self.root/'reports'
     def prepare(self):
         self.private(self.root,True);self.folder.mkdir(mode=0o700,exist_ok=True);self.private(self.folder,True)
+    def failure_event(self,action,request,error):
+        # Separate immutable audit events; never emit raw exception/credentials.
+        self.prepare();folder=self.folder/'failure-audit';folder.mkdir(mode=0o700,exist_ok=True);self.private(folder,True)
+        if not isinstance(request,str) or not re.fullmatch('[A-Za-z0-9_-]{1,64}',request):request=None
+        reason='OS_ERROR' if isinstance(error,OSError) else 'SAFETY_REJECTED'
+        event=dict(timestamp=time.strftime('%Y-%m-%dT%H:%M:%S+00:00',time.gmtime()),operation_id=request,action=action,result='FAILED',reason=reason,errno=getattr(error,'errno',None),source='local-report-export')
+        io=ReportStore(self.root);io.folder=folder
+        io.publish('failure-'+secrets.token_hex(16)+'.json',encode(event))
     @contextmanager
     def lock(self):
         self.prepare();p=self.folder/'export.lock';fd=os.open(p,os.O_CREAT|os.O_APPEND|os.O_WRONLY|os.O_NOFOLLOW,0o600)
@@ -3414,6 +3441,7 @@ class ReportStore(PrivateIO):
         fd=os.open(self.folder,os.O_RDONLY|os.O_DIRECTORY)
         try:os.fsync(fd)
         finally:os.close(fd)
+    @audited_failure('RECOVER')
     def recover(self):
         with self.lock():return self._recover()
     def _recover(self):
@@ -3437,6 +3465,7 @@ class ReportStore(PrivateIO):
         self.write('audit.json',after)
         self.write('transaction.json',dict(status='COMMITTED',version=after['version']))
         return dict(path=str(self.folder/entry['filename']),status='COMMITTED',version=after['version'])
+    @audited_failure('PREVIEW')
     def request_versions(self,kind,request):
         """Menu retries reuse the recorded original CAS/source, not a new request.
         Still bind kind via export fingerprint; never turn changed intent into retry.
@@ -3449,6 +3478,7 @@ class ReportStore(PrivateIO):
                 if body.get('kind')!=kind:raise ValueError('报告ID已用于另一类报告')
                 return prior['before_version'],prior['source']
             return self.ledger()['version'],self.source()['reference']
+    @audited_failure('EXPORT')
     def export(self,kind,operation_id,expected,reference):
         if kind not in KINDS or not isinstance(operation_id,str) or not re.fullmatch('[A-Za-z0-9_-]{1,64}',operation_id) or type(expected) is not int or expected<0 or not isinstance(reference,dict):raise ValueError('报告请求非法')
         request=dict(kind=kind,operation_id=operation_id,expected=expected,reference=reference);fp=sha(encode(request))
@@ -6432,7 +6462,7 @@ if __name__=='__main__':
 
 @@ABC_END
 
-@@ABC_FILE tests/test_report_transactions.py 600 ce43d176735f1878bdec1ad94cf9ca0931d241f94185eab2c5199d6b04369213
+@@ABC_FILE tests/test_report_transactions.py 600 5aa1963724df148b13ead7d41bd35b867d01bc0b0a359566269505d69dc6c242
 """Report publication integration and local crash acceptance, never network."""
 import errno,json,os,select,subprocess,sys,unittest
 from unittest.mock import patch
@@ -6541,6 +6571,23 @@ else:s.export('topology-report','crash',0,json.loads(sys.argv[4]))
   self.kill('prepared');s=self.store();j=s.read('transaction.json');j['content']['body']['primary']='A';s.write('transaction.json',j)
   with self.assertRaises(ValueError):s.recover()
   self.assertFalse((s.folder/'report-crash.json').exists())
+ def test_failure_audit_persisted_and_sanitized(self):
+  self.export();s=self.store()
+  with self.assertRaises(ValueError):self.export('stale-request')
+  files=list((s.folder/'failure-audit').glob('failure-*.json'));self.assertEqual(len(files),1)
+  event=json.loads(files[0].read_text());self.assertEqual(event['operation_id'],'stale-request');self.assertEqual(event['result'],'FAILED');self.assertEqual(event['reason'],'SAFETY_REJECTED');self.assertNotIn('reference',event)
+  self.assertEqual(files[0].stat().st_mode&0o777,0o600)
+ def test_failure_audit_unwritable_reports_secondary_failure(self):
+  from report_store import FailureAuditError
+  s=self.store()
+  with patch.object(s,'failure_event',side_effect=OSError(errno.ENOSPC,'SECRET_SENTINEL')):
+   with self.assertRaises(FailureAuditError) as error:s.export('bad','id',0,{})
+  self.assertNotIn('SECRET_SENTINEL',str(error.exception));self.assertFalse((s.folder/'audit.json').exists())
+ def test_failure_audit_does_not_increment_report_version(self):
+  self.export();s=self.store();before=(s.folder/'audit.json').read_bytes()
+  for _ in range(2):
+   with self.assertRaises(ValueError):self.export('failed-repeat')
+  self.assertEqual(before,(s.folder/'audit.json').read_bytes());self.assertEqual(s.version(),1);self.assertEqual(len(list((s.folder/'failure-audit').glob('failure-*.json'))),2)
 
 if __name__=='__main__':
  r=unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(ReportTests(n) for n in ReportTests.__dict__ if n.startswith('test_')));raise SystemExit(not r.wasSuccessful())
