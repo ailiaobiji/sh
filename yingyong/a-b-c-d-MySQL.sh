@@ -888,6 +888,40 @@ monitor_evaluate要求旧不可用明确模拟证据，候选按B,D选，有独�
 
 @@ABC_END
 
+@@ABC_FILE docs/REPORT-TRANSACTIONS.md 600 2f1c17524b372fbb85743d7018c0996b78a1dcd699f664ccd4273fc4b262ac6b
+# 第三项：报告导出事务与边界
+
+## 接口及目录
+第6项18、第7项19仍调用UI.export；双确认后显式operation_id，ReportStore.request_versions复用既有请求原始CAS及来源，ReportStore.export重新生成报告，不信任UI陈旧预览内容。仅报告方法和两处未使用导入清理，首页panel函数/菜单定义不变。
+
+新文件置于动态项目根reports/，0700目录、0600文件；独立export.lock、audit.json、transaction.json。报告名report-<operation_id>.json，可重复查询同请求，禁止覆盖/删除功能；旧data目录报告不迁移、不清理。公共recover()及python3 -B modules/report_store.py --recover只处理本地历史报告意图，不触发生产或来源配置恢复。
+
+报告审计记录时间、operation_id、前后报告版本、来源配置/审计/模型摘要、结果与原因字段。成功只有COMMITTED；写文件/审计失败抛错保留PREPARED，不显示整个事务成功。失败原因目前由调用方错误输出，尚未形成独立持久化失败审计事件；这是明确缺口。
+
+## 事务
+源获取复用已验收ConfigTransaction.snapshot与ModelStore resolver（不改第一二项核心）。两次源摘要/版本核对检查生成期间变化，并在正文写清本机乐观版本核对，不宣称分布式/全局同步时刻。配置包含敏感值时仅保留摘要/版本，正文仅含脱敏报告字段，不包含配置原文。
+
+报告CAS针对独立audit版本；请求ID绑定kind、原CAS和来源引用。PREPARED持久化目标脱敏正文及前后账本摘要；临时文件写入检查短写、fsync、校验，再hardlink排他发布新报告（不替换既有路径），删除自己的临时链接后fsync；发布audit；最后COMMITTED。
+
+恢复只允许旧或精确目标audit，拒绝更新后的账本；既有报告必须精确匹配才能复用，不覆盖外部修改。恢复完成的是已准备历史快照，即使当前模型变化也不重新生成新的报告内容。已提交报告被修改将阻止后续操作，不掩盖篡改。
+
+## 锁/一致性与风险
+- 不持来源锁跨整个导出事务；两次检查之后来源可继续正常变化，因此报告是带来源版本的历史本地快照，不保证“发布瞬间仍最新”。
+- 首次读取未知模型和首次配置写锁的边界沿用已验收接口，不修改协议；不把原子多文件发布说成一次物理原子提交。
+- 报告审计整体JSON增长，提交会验证历史报告，长期规模性能尚未验证。
+- hardlink发布要求reports位于支持硬链接的本地文件系统；不同FS行为/NFS/断电/攻击性root未验收。
+- SIGKILL/ENOSPC/短写测试使用外部fixture；不是生产或整机断电证明。
+
+## 清理证据
+- 去除UI.export旧operation.lock/随机UUID/write调用链，替换独立ReportStore；UUID仍被节点/CF使用，保留导入。
+- management_ui未使用validate、CHECKS导入经AST Load检查和全项目导入引用检索确认未被重导出使用，删两处导入绑定；node_functions.validate和management_model.CHECKS定义不删。
+- Store、initial、conflicts、channels、settings等仍由动态菜单/兼容测试调用，全部保留；原report参数仍用于预览，不删。
+- build_distribution脚本stat疑似未使用，但无关本次运行链清理不扩大；旧模型、兼容脚本、测试接口不删。
+
+验收须包含最终单文件真实菜单两类报告导出及重试、CLI恢复、全部支持菜单的进入/返回，不把只启动入口等同所有业务完成。
+
+@@ABC_END
+
 @@ABC_FILE docs/ROLE-FIXES.md 600 e677911269a62bacb6fe78b26240dbe34817934994c02848a6212e463552f2ea
 # 阶段二角色与子菜单修正
 
@@ -2094,7 +2128,7 @@ def change(d,action,node,f):
 
 @@ABC_END
 
-@@ABC_FILE modules/management_ui.py 600 f4efe8efc744e73a0f5e9abf31d775c1ac89a05feefb60a1ed98c761d074fe1a
+@@ABC_FILE modules/management_ui.py 600 2b0fca09c75ad137e9c02d40a31a88226f54d97624536ab437999f12d47ba571
 """Formal stage-two UI. All observations and submissions explicitly offline.
 No subprocess/network executors. Ctrl-D/:quit cancels without staged writes.
 """
@@ -2106,8 +2140,8 @@ from pathlib import Path
 import sys
 import uuid
 import getpass
-from node_functions import Store,initial,validate,conflicts
-from management_model import settings,registered,channels,precheck,environment_plan,sync_preview,CHECKS,AUTO_STAGES
+from node_functions import Store,initial,conflicts
+from management_model import settings,registered,channels,precheck,environment_plan,sync_preview,AUTO_STAGES
 from menu_spec import MAIN,MENUS,CHILDREN
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -2428,13 +2462,13 @@ class UI:
         show(dict(report=report,mode='OFFLINE_MODEL'))
         if self.dry:print('Dry-run：未导出文件');return
         if ask('仅导出本地报告，第一次确认yes：')!='yes' or ask('第二次确认yes：')!='yes':raise Cancel()
-        # Same stable model lock and private atomic IO; no business mutation.
-        import fcntl
-        self.store.prepare();fd=os.open(self.store.folder/'operation.lock',os.O_CREAT|os.O_APPEND|os.O_WRONLY|os.O_NOFOLLOW,0o600)
-        try:
-            self.store.private(self.store.folder/'operation.lock');fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            filename=name+'-'+uuid.uuid4().hex+'.json';self.store.write(filename,report);print(str(self.store.folder/filename))
-        finally:os.close(fd)
+        from report_store import ReportStore
+        store=ReportStore(self.root)
+        request=ask('报告operation_id（必须填写，供幂等重试）：')
+        expected,reference=store.request_versions(name,request)
+        result=store.export(name,request,expected,reference)
+        show(result)
+        print('本地报告、独立审计及提交标记均完成；仅为离线报告。')
 
 if __name__=='__main__':
     sys.dont_write_bytecode=True
@@ -3278,6 +3312,175 @@ def main():
   except EOFError:return
   except (OSError,ValueError,KeyError) as e:print('安全拒绝：'+str(e))
 if __name__=='__main__':main()
+
+@@ABC_END
+
+@@ABC_FILE modules/report_store.py 600 d132cb45adff3220a51b1bfbe1c963f3e75463d4c26d46203e8269047c2fbe54
+"""Offline immutable report exports. No overwrite/delete operation is exposed."""
+from contextlib import contextmanager,ExitStack
+from pathlib import Path
+import copy
+import fcntl
+import hashlib
+import json
+import os
+import re
+import tempfile
+import time
+from topology_model import Store as PrivateIO
+from config_transaction import ConfigTransaction
+from domain_store import DomainStore
+from node_functions import Store as ModelStore,initial
+from management_model import channels,settings
+
+KINDS=('topology-report','file-sync-report')
+def encode(value):return json.dumps(value,sort_keys=True,ensure_ascii=False,allow_nan=False,indent=2).encode()+b'\n'
+def sha(data):return hashlib.sha256(data).hexdigest()
+def safe(value):
+    if isinstance(value,dict):
+        return {k:('[REDACTED]' if re.search(r'password|token|secret|private|auth_ref|key_ref|sensitive_ref',k,re.I) else safe(v)) for k,v in value.items()}
+    if isinstance(value,list):return [safe(v) for v in value]
+    return value
+
+class ReportStore(PrivateIO):
+    def __init__(self,root):
+        super().__init__(root);self.folder=self.root/'reports'
+    def prepare(self):
+        self.private(self.root,True);self.folder.mkdir(mode=0o700,exist_ok=True);self.private(self.folder,True)
+    @contextmanager
+    def lock(self):
+        self.prepare();p=self.folder/'export.lock';fd=os.open(p,os.O_CREAT|os.O_APPEND|os.O_WRONLY|os.O_NOFOLLOW,0o600)
+        try:self.private(p);fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);yield
+        finally:os.close(fd)
+    def source(self):
+        """Capture validated bytes, then verify same source fingerprints again.
+        This is optimistic local consistency, not a distributed-time snapshot.
+        """
+        with ExitStack() as stack:
+            config=ConfigTransaction(self.root)
+            stack.enter_context(config.locked(readonly=True));snapshot=config.snapshot()
+            domains=DomainStore(self.root)
+            if domains.enabled:
+                # Existing accepted resolver owns its shared read lock.
+                model=ModelStore(self.root).load();origin='OFFLINE_DOMAINS'
+            else:
+                p=self.root/'data/offline-functions/topology.json'
+                legacy=self.root/'data/offline-topology/topology.json'
+                if p.exists() or p.is_symlink():model=ModelStore(self.root).load();origin='OFFLINE_FUNCTIONS'
+                elif legacy.exists() or legacy.is_symlink():raise ValueError('旧schema2报告需明确适配，禁止伪装新拓扑')
+                else:model=initial();origin='UNINITIALIZED'
+            return dict(model=model,reference=dict(origin=origin,topology_version=model['version'],domain_versions=model.get('domain_versions'),model_sha256=sha(encode(model)),config_version=snapshot['version'],config_sha256=snapshot['config_sha256'],config_audit_sha256=sha(encode(snapshot['ledger']))))
+    def version(self):
+        if not self.folder.exists():return 0
+        return self.ledger()['version']
+    def ledger(self):
+        p=self.folder/'audit.json';d=self.read(p.name) if p.exists() or p.is_symlink() else dict(schema=1,version=0,entries=[])
+        return self.validate_ledger(d)
+    def validate_ledger(self,d):
+        if not isinstance(d,dict) or set(d)!={'schema','version','entries'} or d['schema']!=1 or type(d['version']) is not int or d['version']<0 or not isinstance(d['entries'],list) or len(d['entries'])!=d['version']:raise ValueError('报告审计结构损坏')
+        ids=[]
+        for i,e in enumerate(d['entries'],1):
+            if not isinstance(e,dict) or set(e)!={'operation_id','fingerprint','filename','sha256','timestamp','source','before_version','after_version','result','reason'} or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',e.get('operation_id','')) or e['filename']!='report-'+e['operation_id']+'.json' or e['before_version']!=i-1 or e['after_version']!=i or e['result']!='COMMITTED' or e['reason'] is not None or not isinstance(e['source'],dict):raise ValueError('报告审计记录损坏')
+            for k in ('fingerprint','sha256'):
+                if not isinstance(e[k],str) or not re.fullmatch('[a-f0-9]{64}',e[k]):raise ValueError('报告摘要损坏')
+            ids.append(e['operation_id'])
+        if len(ids)!=len(set(ids)):raise ValueError('报告请求ID重复')
+        return d
+    def publish(self,filename,content):
+        if not isinstance(filename,str) or not re.fullmatch(r'[A-Za-z0-9_-]+\.json',filename):raise ValueError('报告文件名非法')
+        # Exclusive hard-link publication of a private fsynced temp inode.
+        # Never replace an existing report, including on recovery.
+        p=self.folder/filename
+        if p.exists() or p.is_symlink():
+            self.private(p)
+            if p.read_bytes()!=content:raise ValueError('报告已存在且内容不同，禁止覆盖')
+            return
+        fd,tmp=tempfile.mkstemp(prefix='.report-',dir=self.folder)
+        try:
+            try:
+                view=memoryview(content)
+                while view:
+                    written=os.write(fd,view)
+                    if written<=0:raise OSError('报告短写失败')
+                    view=view[written:]
+                os.fsync(fd)
+            finally:os.close(fd)
+            if Path(tmp).read_bytes()!=content:raise ValueError('临时报告完整性失败')
+            os.link(tmp,p,follow_symlinks=False)
+        finally:
+            if os.path.exists(tmp):os.unlink(tmp)
+        self.sync()
+    def sync(self):
+        fd=os.open(self.folder,os.O_RDONLY|os.O_DIRECTORY)
+        try:os.fsync(fd)
+        finally:os.close(fd)
+    def recover(self):
+        with self.lock():return self._recover()
+    def _recover(self):
+        p=self.folder/'transaction.json'
+        if not p.exists() and not p.is_symlink():return
+        j=self.read(p.name)
+        if not isinstance(j,dict):raise ValueError('报告意图损坏')
+        if j.get('status')=='COMMITTED':
+            if set(j)!={'status','version'} or j['version']!=self.ledger()['version']:raise ValueError('报告提交标记不一致')
+            for e in self.ledger()['entries']:
+                report=self.folder/e['filename'];self.private(report)
+                if sha(report.read_bytes())!=e['sha256']:raise ValueError('既有报告损坏，禁止掩盖后续提交')
+            return
+        if set(j)!={'status','before_sha256','after','content','content_sha256'} or j['status']!='PREPARED':raise ValueError('报告PREPARED损坏')
+        after=self.validate_ledger(j['after']);current=self.ledger()
+        if current!=after and (sha(encode(current))!=j['before_sha256'] or after['version']!=current['version']+1 or after['entries'][:-1]!=current['entries']):raise ValueError('报告审计已有新版本，恢复拒绝覆盖')
+        if not after['entries']:raise ValueError('恢复审计为空')
+        entry=after['entries'][-1];content=encode(j['content'])
+        if sha(content)!=j['content_sha256'] or entry['sha256']!=sha(content) or j['content'].get('operation_id')!=entry['operation_id'] or j['content'].get('source')!=entry['source']:raise ValueError('报告恢复内容损坏')
+        self.publish(entry['filename'],content)
+        self.write('audit.json',after)
+        self.write('transaction.json',dict(status='COMMITTED',version=after['version']))
+        return dict(path=str(self.folder/entry['filename']),status='COMMITTED',version=after['version'])
+    def request_versions(self,kind,request):
+        """Menu retries reuse the recorded original CAS/source, not a new request.
+        Still bind kind via export fingerprint; never turn changed intent into retry.
+        """
+        with self.lock():
+            self._recover()
+            prior=next((e for e in self.ledger()['entries'] if e['operation_id']==request),None)
+            if prior:
+                p=self.folder/prior['filename'];self.private(p);body=self.read(p.name)
+                if body.get('kind')!=kind:raise ValueError('报告ID已用于另一类报告')
+                return prior['before_version'],prior['source']
+            return self.ledger()['version'],self.source()['reference']
+    def export(self,kind,operation_id,expected,reference):
+        if kind not in KINDS or not isinstance(operation_id,str) or not re.fullmatch('[A-Za-z0-9_-]{1,64}',operation_id) or type(expected) is not int or expected<0 or not isinstance(reference,dict):raise ValueError('报告请求非法')
+        request=dict(kind=kind,operation_id=operation_id,expected=expected,reference=reference);fp=sha(encode(request))
+        with self.lock():
+            self._recover();old=self.ledger();prior=next((e for e in old['entries'] if e['operation_id']==operation_id),None)
+            if prior:
+                if prior['fingerprint']!=fp:raise ValueError('报告operation_id请求冲突')
+                p=self.folder/prior['filename'];self.private(p)
+                if sha(p.read_bytes())!=prior['sha256']:raise ValueError('已提交报告被修改，拒绝幂等成功')
+                return dict(path=str(p),status='COMMITTED',version=prior['after_version'])
+            if old['version']!=expected:raise ValueError('报告CAS版本冲突')
+            captured=self.source()
+            if captured['reference']!=reference:raise ValueError('来源配置/拓扑/审计版本已变化')
+            model=captured['model'];m=settings(model)
+            body=channels(model) if kind=='topology-report' else dict(sync=m['sync'],ssh=m['ssh'],directions=channels(model)['files'])
+            content=dict(schema=1,mode='OFFLINE_REPORT',operation_id=operation_id,kind=kind,source=reference,consistency='本机乐观版本核对；非分布式或生产一致性证明',body=safe(body))
+            # Check the model/config pair again. Historical bytes stay immutable.
+            if self.source()['reference']!=reference:raise ValueError('生成期间来源变化，拒绝混合快照')
+            filename='report-'+operation_id+'.json';p=self.folder/filename
+            if p.exists() or p.is_symlink():raise ValueError('报告路径已占用，禁止覆盖')
+            new=copy.deepcopy(old);new['version']+=1
+            new['entries'].append(dict(operation_id=operation_id,fingerprint=fp,filename=filename,sha256=sha(encode(content)),timestamp=time.strftime('%Y-%m-%dT%H:%M:%S+00:00',time.gmtime()),source=reference,before_version=old['version'],after_version=new['version'],result='COMMITTED',reason=None))
+            self.validate_ledger(new)
+            self.write('transaction.json',dict(status='PREPARED',before_sha256=sha(encode(old)),after=new,content=content,content_sha256=sha(encode(content))))
+            return self._recover()
+
+if __name__=='__main__':
+    import sys
+    store=ReportStore(Path(__file__).resolve().parents[1])
+    if sys.argv[1:]!=['--recover']:raise SystemExit('仅支持本地报告 --recover')
+    try:print(json.dumps(store.recover(),ensure_ascii=False))
+    except (ValueError,OSError,KeyError,TypeError):raise SystemExit('报告恢复安全拒绝，保留现场。')
 
 @@ABC_END
 
@@ -6226,6 +6429,121 @@ class RenameTests(FrameworkTests):
 if __name__=='__main__':
  suite=unittest.TestSuite(RenameTests(n) for n in RenameTests.__dict__ if n.startswith('test_'))
  result=unittest.TextTestRunner(verbosity=2).run(suite);raise SystemExit(not result.wasSuccessful())
+
+@@ABC_END
+
+@@ABC_FILE tests/test_report_transactions.py 600 ce43d176735f1878bdec1ad94cf9ca0931d241f94185eab2c5199d6b04369213
+"""Report publication integration and local crash acceptance, never network."""
+import errno,json,os,select,subprocess,sys,unittest
+from unittest.mock import patch
+from test_framework import FrameworkTests,SOURCE
+sys.path.insert(0,str(SOURCE/'modules'))
+from report_store import ReportStore,encode,sha
+
+class ReportTests(FrameworkTests):
+ def store(self):return ReportStore(self.root)
+ def export(self,request='one',expected=0,kind='topology-report',reference=None):
+  s=self.store();return s.export(kind,request,expected,reference or s.source()['reference'])
+ def test_export_idempotency_cas_and_id_conflict(self):
+  s=self.store();ref=s.source()['reference'];a=self.export(reference=ref);self.assertEqual(a,self.export(reference=ref));self.assertEqual(s.version(),1)
+  with self.assertRaises(ValueError):self.export(kind='file-sync-report',reference=ref)
+  with self.assertRaises(ValueError):self.export('two',reference=ref)
+  self.assertEqual(len(list(s.folder.glob('report-*.json'))),1)
+ def test_real_two_process_same_version(self):
+  ref=self.store().source()['reference'];code="from report_store import ReportStore;import sys,json;s=ReportStore(sys.argv[1]);s.export('topology-report',sys.argv[2],0,json.loads(sys.argv[3]))"
+  ps=[subprocess.Popen([sys.executable,'-B','-c',code,str(self.root),'op'+str(i),json.dumps(ref)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=dict(self.env,PYTHONPATH=str(SOURCE/'modules'))) for i in range(2)]
+  codes=[]
+  for p in ps:p.communicate(timeout=20);codes.append(p.returncode)
+  self.assertEqual(sum(c==0 for c in codes),1);self.assertEqual(self.store().version(),1)
+ def kill(self,phase,recovery=False):
+  s=self.store();ref=s.source()['reference']
+  code="""from report_store import ReportStore
+import sys,json
+s=ReportStore(sys.argv[1]);phase=sys.argv[2];original=s.write;publish=s.publish
+def write(name,value):
+ original(name,value)
+ if (phase=='prepared' and name=='transaction.json' and value.get('status')=='PREPARED') or (phase=='audit' and name=='audit.json'):
+  print('READY',flush=True);sys.stdin.readline()
+def pub(name,content):
+ publish(name,content)
+ if phase=='published':print('READY',flush=True);sys.stdin.readline()
+s.write=write;s.publish=pub
+if sys.argv[3]=='recover':s.recover()
+else:s.export('topology-report','crash',0,json.loads(sys.argv[4]))
+"""
+  p=subprocess.Popen([sys.executable,'-B','-c',code,str(self.root),phase,'recover' if recovery else 'export',json.dumps(ref)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(self.env,PYTHONPATH=str(SOURCE/'modules')))
+  self.assertTrue(select.select([p.stdout],[],[],15)[0]);self.assertEqual(p.stdout.readline().strip(),'READY');p.kill();p.communicate(timeout=10);self.assertEqual(p.returncode,-9)
+ def test_sigkill_prepared_and_recovery_again(self):
+  self.kill('prepared');self.kill('published',True);result=self.store().recover();self.assertEqual(result['status'],'COMMITTED');self.assertEqual(self.store().version(),1)
+ def test_sigkill_file_before_audit(self):
+  self.kill('published');self.assertEqual(self.store().version(),0);self.store().recover();self.assertEqual(self.store().version(),1)
+ def test_sigkill_audit_before_commit(self):
+  self.kill('audit');self.assertEqual(self.store().version(),1);self.store().recover();self.assertEqual(len(list(self.store().folder.glob('report-*.json'))),1)
+ def test_external_modified_file_recovery_refuses(self):
+  self.kill('published');p=self.store().folder/'report-crash.json';p.write_text('external');p.chmod(0o600)
+  with self.assertRaises(ValueError):self.store().recover()
+  self.assertEqual(p.read_text(),'external');self.assertEqual(self.store().version(),0)
+ def test_audit_failure_enospc_then_recover(self):
+  s=self.store();original=s.write
+  def write(name,value):
+   if name=='audit.json':raise OSError(errno.ENOSPC,'injected')
+   return original(name,value)
+  with patch.object(s,'write',side_effect=write):
+   with self.assertRaises(OSError):s.export('topology-report','disk',0,s.source()['reference'])
+  self.assertEqual(s.version(),0);self.assertTrue((s.folder/'report-disk.json').exists());s.recover();self.assertEqual(s.version(),1)
+ def test_commit_marker_failure_recover(self):
+  s=self.store();original=s.write
+  def write(name,value):
+   if name=='transaction.json' and value.get('status')=='COMMITTED':raise OSError(errno.ENOSPC,'injected')
+   return original(name,value)
+  with patch.object(s,'write',side_effect=write):
+   with self.assertRaises(OSError):s.export('topology-report','marker',0,s.source()['reference'])
+  s.recover();self.assertEqual(s.read('transaction.json')['status'],'COMMITTED')
+ def test_short_write_and_zero_write(self):
+  s=self.store();s.prepare();original=os.write
+  with patch('os.write',side_effect=lambda fd,data:original(fd,data[:3])):s.publish('short.json',b'1234567890')
+  self.assertEqual((s.folder/'short.json').read_bytes(),b'1234567890')
+  with patch('os.write',return_value=0):
+   with self.assertRaises(OSError):s.publish('zero.json',b'123')
+  self.assertFalse((s.folder/'zero.json').exists())
+ def test_permissions_and_corrupt_journal(self):
+  s=self.store();s.prepare();s.folder.chmod(0o755)
+  with self.assertRaises(ValueError):self.export()
+  s.folder.chmod(0o700);s.write('transaction.json',{'status':'UNKNOWN'})
+  with self.assertRaises(ValueError):s.recover()
+ def test_source_version_change_refused(self):
+  s=self.store();ref=s.source()['reference'];self.conf.write_text(self.conf.read_text().replace('CF_DOMAIN=""','CF_DOMAIN="example.com"'))
+  with self.assertRaises(ValueError):self.export(reference=ref)
+  self.assertEqual(s.version(),0)
+ def test_report_matches_single_source_and_redacts(self):
+  s=self.store();ref=s.source()['reference'];result=self.export(reference=ref);body=json.loads(open(result['path']).read());self.assertEqual(body['source'],ref);self.assertEqual(body['body']['primary'],None);self.assertEqual(body['mode'],'OFFLINE_REPORT');self.assertNotIn('CF_API_TOKEN',open(result['path']).read())
+ def test_actual_menu_export_and_dryrun(self):
+  before=self.snapshot();p=self.run_cli('--dry-run',text='6\n18\n\n0\n0\n');self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(before,self.snapshot())
+  p=self.run_cli(text='6\n18\nyes\nyes\nmenu-export\n\n0\n0\n');self.assertEqual(p.returncode,0,p.stderr);self.assertIn('"status": "COMMITTED"',p.stdout);self.assertTrue((self.root/'reports/report-menu-export.json').exists())
+ def test_existing_path_and_committed_tamper_refused(self):
+  result=self.export();p=self.store().folder/'report-one.json';p.write_text('changed')
+  with self.assertRaises(ValueError):self.export()
+  self.assertEqual(p.read_text(),'changed')
+ def test_history_preserved_after_failed_new_export(self):
+  self.export();s=self.store();old=(s.folder/'report-one.json').read_bytes()
+  with patch.object(s,'publish',side_effect=OSError(errno.EACCES,'injected')):
+   with self.assertRaises(OSError):s.export('file-sync-report','new',1,s.source()['reference'])
+  self.assertEqual(old,(s.folder/'report-one.json').read_bytes());s.recover();self.assertEqual(s.version(),2)
+ def test_actual_both_menu_exports_and_retry(self):
+  for menu,choice,request in (('6','18','top-menu'),('7','19','files-menu'),('6','18','top-menu')):
+   p=self.run_cli(text=f'{menu}\n{choice}\nyes\nyes\n{request}\n\n0\n0\n');self.assertEqual(p.returncode,0,p.stderr);self.assertIn('"status": "COMMITTED"',p.stdout)
+  self.assertEqual(self.store().version(),2);self.assertEqual(len(list(self.store().folder.glob('report-*.json'))),2)
+ def test_filename_traversal_rejected(self):
+  s=self.store();s.prepare()
+  with self.assertRaises(ValueError):s.publish('../escape.json',b'bad')
+  self.assertFalse((self.root/'escape.json').exists())
+ def test_corrupt_prepared_content_refused(self):
+  self.kill('prepared');s=self.store();j=s.read('transaction.json');j['content']['body']['primary']='A';s.write('transaction.json',j)
+  with self.assertRaises(ValueError):s.recover()
+  self.assertFalse((s.folder/'report-crash.json').exists())
+
+if __name__=='__main__':
+ r=unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(ReportTests(n) for n in ReportTests.__dict__ if n.startswith('test_')));raise SystemExit(not r.wasSuccessful())
 
 @@ABC_END
 
