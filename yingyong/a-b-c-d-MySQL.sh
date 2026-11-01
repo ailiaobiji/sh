@@ -814,6 +814,19 @@ schema=1，source=C，identity_verified、collector_ok；checked_at 与各 nodes
 
 @@ABC_END
 
+@@ABC_FILE docs/MONITOR-TEST-CONTRACT.md 600 397766f8117006e728d1aee40229e08716deb38cc0ac8caea806fbe28d6826f6
+# 第二批第二项旧监控测试合同适配
+
+管理员明确批准测试合同适配，不修改冻结首页。本次只改tests/test_monitor.py及本说明，随后同步分发内嵌文件。
+
+- test_fault_matrix_and_recovery_history原首页“节点 A：正常”改为七个正式标签全为暂无，并检查无正常/在线/Primary误报、拓扑primary=null。原健康正例没有删除：迁到仍支持的只读modules/dashboard.py独立入口，继续断言“节点 A：正常”和“仅服务器在线，业务健康独立验证”、未知Primary。
+- test_corruption_expiry_and_boot保留过期和boot不符不正常断言，增加首页七标签未知及null Primary。损坏JSON后的旧字段期望适配正式首页，同时在兼容观察视图保留未知Primary断言。原monitor采集恢复验证不变。
+- 旧监控其余五项不改，包含间隔配置、worker重复/停止/重启、同步范围及未配置安全检查。
+
+这是两项历史菜单合同修正，不是把模拟采集升级为正式业务健康。SSH边界仍为测试桩，不连接远端。原测试方法全部保留，不跳过、不删除功能断言，不改活动首页或观察模块。
+
+@@ABC_END
+
 @@ABC_FILE docs/MONITORING.md 600 07ac489cf31bc8583f244f58f6d387a429f2ab96223ac3289a1dea29231dc687
 # C 节点只读监控
 
@@ -890,7 +903,7 @@ A/B/D物理ID不变，promote任一Active候选在同一事务把旧Primary变Re
 
 @@ABC_END
 
-@@ABC_FILE modules/cloudflare_config.py 600 39679efd1fc110ecf51c65c4c6c5b15525777369330fe2d8d7da52a03e4d6d95
+@@ABC_FILE modules/cloudflare_config.py 600 674551b1dce8fb8aae3a2910adbb53450c750ebc145b6b9a75a72437b7e6a030
 """One protected CF configuration: existing config.env; offline checks only."""
 import re
 from topology_model import Store
@@ -901,12 +914,8 @@ class Cloudflare:
     def read(self):
         from config_transaction import ConfigTransaction
         tx=ConfigTransaction(self.io.root)
-        with tx.locked(readonly=True):
-            tx.pending()
-            return self._read()
-    def _read(self):
-        p=self.io.folder/'config.env';self.io.private(p)
-        raw=p.read_text();values={}
+        snapshot=tx.snapshot()
+        raw=snapshot['config'].decode();values={}
         for line in raw.splitlines():
             if not line or line.startswith('#'):continue
             match=re.fullmatch(r'([A-Z][A-Z0-9_]*)="([^"\n]*)"',line)
@@ -922,11 +931,10 @@ class Cloudflare:
     def history(self):
         from config_transaction import ConfigTransaction
         tx=ConfigTransaction(self.io.root)
-        with tx.locked(readonly=True):
-            tx.pending()
-            p=self.io.folder/'cloudflare-history.json'
-            old=self.io.read(p.name) if p.exists() or p.is_symlink() else []
-            return old+[x for x in tx.ledger()['operations'] if x['domain']=='cloudflare']
+        snapshot=tx.snapshot()
+        p=self.io.folder/'cloudflare-history.json'
+        old=self.io.read(p.name) if p.exists() or p.is_symlink() else []
+        return old+[x for x in snapshot['ledger']['operations'] if x['domain']=='cloudflare']
     def recover(self):
         from config_transaction import ConfigTransaction
         ConfigTransaction(self.io.root).recover()
@@ -959,7 +967,7 @@ init_colors
 
 @@ABC_END
 
-@@ABC_FILE modules/common.sh 700 1bb8588534a26cd430a691727264f70373fff3be1427686c8cdcc4a5f585312f
+@@ABC_FILE modules/common.sh 700 3ad6916730192fc5c154f7f1948d8c8322afe7990ca01a2f2a145761b3500d65
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # 所有模块共用；只接受项目内配置，不 source 配置中的代码。
@@ -996,7 +1004,7 @@ validate_storage() {
     done
 }
 load_config() {
-    local file="$PROJECT_DIR/config/config.env" line key value mode
+    local file="$PROJECT_DIR/config/config.env" line key value mode config_content
     local -A seen=()
     # 向后兼容扩展：不改写现有 config.env；缺失的新字段采用安全默认值。
     AUTO_FAILOVER_ENABLED=false
@@ -1031,6 +1039,16 @@ load_config() {
     validate_private_file "$file" || { die '配置不是安全的单链接私有普通文件'; return 1; }
     mode=$(stat -c %a "$file") || return 1
     [[ $mode == 600 && $(stat -c %u "$file") == "$EUID" ]] || { die '配置必须属于当前用户且权限为 600'; return 1; }
+    # Transaction-enabled installs read a committed snapshot; no recovery here.
+    # Legacy/staged candidates have no journal and retain the original parser.
+    if [[ -e $PROJECT_DIR/config/config-transaction.json || -L $PROJECT_DIR/config/config-transaction.json || -e $PROJECT_DIR/config/config-write.lock || -L $PROJECT_DIR/config/config-write.lock ]]; then
+        config_content=$(python3 -B "$PROJECT_DIR/modules/config_transaction.py" --snapshot-config) || return 1
+    else
+        config_content=$(< "$file")
+        if [[ -e $PROJECT_DIR/config/config-write.lock || -L $PROJECT_DIR/config/config-write.lock ]]; then
+            config_content=$(python3 -B "$PROJECT_DIR/modules/config_transaction.py" --snapshot-config) || return 1
+        fi
+    fi
     while IFS= read -r line || [[ -n $line ]]; do
         [[ -z $line || $line == \#* ]] && continue
         if [[ $line =~ ^([A-Z][A-Z0-9_]*)=\"([^\"]*)\"$ ]]; then
@@ -1049,7 +1067,7 @@ load_config() {
         else
             printf -v "$key" '%s' "$value"
         fi
-    done < "$file"
+    done <<< "$config_content"
     local required
     for required in PROJECT_DIR CONFIG_VERSION NODE_ROLE A_PUBLIC_IP B_PUBLIC_IP C_PUBLIC_IP A_PRIVATE_IP B_PRIVATE_IP C_PRIVATE_IP SSH_USER SSH_PORT SSH_TIMEOUT MYSQL_PORT MYSQL_USER MYSQL_PASSWORD MYSQL_REPLICATION_MODE COMMUNICATION_MODE CF_API_TOKEN CF_ZONE_ID CF_DOMAIN WEB_ROOT RSYNC_SOURCE RSYNC_DEST SYNC_EXCLUDES REDIS_USAGE RSYNC_DELETE SYNC_DEBOUNCE_SECONDS MONITOR_INTERVAL FAILURE_THRESHOLD AUTO_FAILOVER AUTO_FAILBACK LOG_MAX_BYTES LOG_KEEP; do
         [[ -v seen[$required] ]] || { die "配置缺少字段：$required"; return 1; }
@@ -1179,7 +1197,7 @@ handle_error() { printf '操作未完成，返回菜单（退出码 %s）。\n' 
 
 @@ABC_END
 
-@@ABC_FILE modules/config_transaction.py 600 a5aac7ed8750b5e3a344a3dd5b0ea00d2a503bcc6a75891300a78ca9fcbb4596
+@@ABC_FILE modules/config_transaction.py 600 8c50d875a9e163a130017abc712ab7d0f02c85cfb7ecf3ac7c66c6c0108373a6
 """One private config.env publisher. Offline local transactions, no network."""
 from contextlib import contextmanager
 from pathlib import Path
@@ -1244,6 +1262,23 @@ class ConfigTransaction:
         if p.exists() or p.is_symlink():
             j=self.io.read(p.name)
             if not isinstance(j,dict) or set(j)!={'status','version'} or j.get('status')!='COMMITTED' or j.get('version')!=self.ledger()['version']:raise ValueError('配置事务未完成；需显式恢复，不报告成功')
+    def snapshot(self):
+        """Read committed config+audit together, without recovery or file writes.
+
+        Before the first writer creates its lock, verify no lock/intent appeared
+        during the optimistic read. Never claim a joint snapshot from raw().
+        """
+        for _ in range(3):
+            lock=self.io.folder/'config-write.lock'
+            existed=lock.exists() or lock.is_symlink()
+            with self.locked(readonly=True):
+                self.pending()
+                raw=self.raw();ledger=self.ledger()
+                self.pending()
+                if not existed and (lock.exists() or lock.is_symlink()):continue
+                if raw!=self.raw():continue
+                return dict(config=raw,ledger=ledger,version=ledger['version'],config_sha256=digest(raw))
+        raise ValueError('配置读取期间发生并发初始化，安全重试')
     def validate(self,raw):
         # Exact common parser, bounded private staging; never source config as code.
         with tempfile.TemporaryDirectory(prefix='config-validation-',dir=self.io.root/'tmp') as temp:
@@ -1320,7 +1355,13 @@ class ConfigTransaction:
 
 if __name__=='__main__':
     import sys
-    if sys.argv[1:]!=['--recover']:raise SystemExit('仅支持 --recover；不执行DNS操作')
+    if sys.argv[1:]==['--snapshot-config']:
+        try:
+            value=ConfigTransaction(Path(__file__).resolve().parents[1]).snapshot()
+            sys.stdout.buffer.write(value['config'])
+        except (ValueError,OSError,KeyError,TypeError):raise SystemExit('配置快照读取拒绝；需检查事务状态，原文隐藏。')
+        raise SystemExit(0)
+    if sys.argv[1:]!=['--recover']:raise SystemExit('仅支持本地 --recover / --snapshot-config')
     try:
         ConfigTransaction(Path(__file__).resolve().parents[1]).recover()
         print('本地配置事务恢复完成；未连接Cloudflare或修改DNS。')
@@ -2426,7 +2467,7 @@ CHILDREN={('7',22):'7c',('9',2):'9s',('9',3):'9t',('9',4):'9p',('9',5):'9m',('9'
 
 @@ABC_END
 
-@@ABC_FILE modules/monitor_engine.py 600 f2bcb2186a741e07afce5e5765dd986d6ff2dacd1b2e1077c6f1c2facd825000
+@@ABC_FILE modules/monitor_engine.py 600 520bbc334e8a69a0d7fcb871d744d906429154ce7710d81265c6ba9340ab058d
 #!/usr/bin/env python3
 """C-only monitoring: bounded read-only SSH, private snapshots/history, no data-plane writes."""
 from concurrent.futures import ThreadPoolExecutor
@@ -2708,7 +2749,10 @@ def worker():
             if result.returncode:
                 append_history([dict(time=int(time.time()), object='C', category='worker', result='error', reason='采集子进程失败', recovered_at=None)])
             # Re-read only literal numeric interval; next collection uses full config validator.
-            match = re.search(r'^MONITOR_INTERVAL="([1-9][0-9]{0,8})"$', (ROOT/'config/config.env').read_text(), re.M)
+            from config_transaction import ConfigTransaction
+            try:interval_config=ConfigTransaction(ROOT).snapshot()['config'].decode()
+            except (ValueError,OSError):interval_config=''
+            match = re.search(r'^MONITOR_INTERVAL="([1-9][0-9]{0,8})"$', interval_config, re.M)
             delay = int(match.group(1)) if match else 30
             while not stopped and time.monotonic() - begin < max(5, min(delay, 3600)):
                 time.sleep(0.25)
@@ -3769,13 +3813,13 @@ log_event CHECK || exit 1
 
 @@ABC_END
 
-@@ABC_FILE scripts/cloudflare.sh 700 c4f655055eb3ad79b72eade446f2477a3d9cf6a172644ecce4753a4ed07ffac1
+@@ABC_FILE scripts/cloudflare.sh 700 8dc21f1faccf2554415c2bb5ccb824ca61cc6b060d8189790da1697968d2d5ae
 #!/usr/bin/env bash
 # shellcheck source=../modules/common.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/../modules/common.sh"
 [[ ${1:-} != --dry-run ]] || DRY_RUN=true
-bootstrap || exit 1
 if [[ $# == 1 && $1 == --recover ]]; then
+    validate_storage || exit 1
     echo '仅恢复本地统一配置事务，不连接Cloudflare或修改DNS。'
     printf '第一次确认，输入yes：'
     IFS= read -r answer || exit 1
@@ -3785,6 +3829,7 @@ if [[ $# == 1 && $1 == --recover ]]; then
     [[ $answer == yes ]] || exit 1
     exec python3 -B "$PROJECT_DIR/modules/config_transaction.py" --recover
 fi
+bootstrap || exit 1
 [[ $# -eq 0 || ( $# -eq 1 && $1 == --dry-run ) ]] || { die '未知模块参数'; exit 2; }
 blocked_module 'Cloudflare 免费 DNS 配置'
 
@@ -4828,6 +4873,45 @@ if __name__=='__main__':unittest.main(verbosity=2)
 
 @@ABC_END
 
+@@ABC_FILE tests/test_config_snapshot.py 600 b99c2221fc390158b58489d334e3855a15aaa869c1a7e0ba908d6ce998a811a2
+"""Joint-read regression, external fixtures, no provider calls."""
+import sys,subprocess,json,os
+import unittest
+from test_cf_transactions import CFTests,SOURCE
+from config_transaction import ConfigTransaction,digest
+
+class ReadTests(CFTests):
+ def test_snapshot_config_matches_audit_version(self):
+  tx=self.tx();tx.update({'CF_DOMAIN':'example.com'},self.version(),'snap')
+  s=tx.snapshot();self.assertEqual(s['version'],1);self.assertEqual(s['ledger']['operations'][-1]['operation_id'],'snap');self.assertIn(b'CF_DOMAIN="example.com"',s['config']);self.assertEqual(s['config_sha256'],digest(s['config']))
+ def test_shell_rejects_uncommitted_and_recovery_still_works(self):
+  self.crash('published');p=self.run_cli('--dry-run',text='0\n');self.assertNotEqual(p.returncode,0);self.assertNotIn('请输入编号',p.stdout)
+  p=self.run_cli('--recover',text='yes\nyes\n',script='scripts/cloudflare.sh');self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(self.run_cli('--dry-run',text='0\n').returncode,0)
+ def test_concurrent_snapshots_never_mix_config_and_ledger(self):
+  tx=self.tx();tx.update({'CF_DOMAIN':'v1.com'},self.version(),'v1')
+  code="""from config_transaction import ConfigTransaction,digest
+import sys,time
+s=ConfigTransaction(sys.argv[1])
+for i in range(2,15):
+ while True:
+  try:s.update({'CF_DOMAIN':'v'+str(i)+'.com'},digest(s.raw()),'v'+str(i));break
+  except BlockingIOError:time.sleep(.002)
+"""
+  p=subprocess.Popen([sys.executable,'-B','-c',code,str(self.root)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=dict(self.env,PYTHONPATH=str(SOURCE/'modules')))
+  successes=0
+  for _ in range(100):
+   try:
+    s=tx.snapshot();self.assertIn(('CF_DOMAIN="v'+str(s['version'])+'.com"').encode(),s['config']);successes+=1
+   except BlockingIOError:pass
+  stdout,stderr=p.communicate(timeout=30);self.assertEqual(p.returncode,0,stderr);self.assertGreater(successes,0);self.assertEqual(tx.snapshot()['version'],14)
+ def test_first_view_writes_no_lock_or_data(self):
+  before=self.snapshot();self.tx().snapshot();self.assertEqual(before,self.snapshot())
+
+if __name__=='__main__':
+ r=unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(ReadTests(n) for n in ReadTests.__dict__ if n.startswith('test_')));raise SystemExit(not r.wasSuccessful())
+
+@@ABC_END
+
 @@ABC_FILE tests/test_distribution.py 600 c8cdced1a8e1ebf0f16a9640236877bf4593d1c22f35b19925afa83d8f7ae21f
 import subprocess
 from pathlib import Path
@@ -5706,7 +5790,7 @@ if __name__ == '__main__':
 
 @@ABC_END
 
-@@ABC_FILE tests/test_monitor.py 600 1c5b489508d11b20462c81f5329cd4797b1266c75a2588583577ff43dbac246b
+@@ABC_FILE tests/test_monitor.py 600 ae11c47fa3af3360ce4f3fdfe51e91e7bc77c6f837d3609901da7f0e279c7717
 #!/usr/bin/env python3
 """Monitor fault tests: isolated C copy, SSH transport boundary stub, no production writes."""
 import json
@@ -5775,8 +5859,13 @@ print(json.dumps(r))
         self.mode.write_text('normal'); self.monitor('--once')
         self.assertIn('"recovered_at": 1',self.monitor('--history','A').stdout)
         menu=self.run_cli('--dry-run',text='0\n').stdout
-        self.assertIn('节点 A：正常',menu)
-        self.assertIn('当前生产主节点：暂无',menu)
+        # Approved formal home contract: legacy observations are not production
+        # authority. Preserve positive health rendering in its supported view.
+        self.assert_frozen_unknown(menu)
+        observed=self.compatibility_panel()
+        self.assertIn('节点 A：正常',observed)
+        self.assertIn('仅服务器在线，业务健康独立验证',observed)
+        self.assertIn('当前生产主节点：暂无',observed)
 
     def test_files_backlog_and_scope(self):
         self.setup_c()
@@ -5792,11 +5881,31 @@ print(json.dumps(r))
         path=self.root/'data/c-status.json'
         data=json.loads(path.read_text()); data['checked_at']=1; path.write_text(json.dumps(data))
         self.assertNotIn('：正常',self.run_cli('--dry-run',text='0\n').stdout)
+        self.assert_frozen_unknown(self.run_cli('--dry-run',text='0\n').stdout)
+        self.assertNotIn('节点 A：正常',self.compatibility_panel())
         data['checked_at']=int(time.time()); data['collector_boot_id']='old-boot'; path.write_text(json.dumps(data))
         self.assertNotIn('：正常',self.run_cli('--dry-run',text='0\n').stdout)
+        self.assert_frozen_unknown(self.run_cli('--dry-run',text='0\n').stdout)
+        self.assertNotIn('节点 A：正常',self.compatibility_panel())
         path.write_text('{invalid')
-        self.assertIn('当前生产主节点：暂无',self.run_cli('--dry-run',text='0\n').stdout)
+        self.assert_frozen_unknown(self.run_cli('--dry-run',text='0\n').stdout)
+        self.assertIn('当前生产主节点：暂无',self.compatibility_panel())
         self.assertEqual(self.monitor('--once').returncode,0)
+
+    def assert_frozen_unknown(self,menu):
+        for label in ('生产 A','备份 B','备份 C','备份 D','监控 A','监控 B','监控 C'):
+            self.assertIn(label+'：暂无（状态缺失、过期或无法确认）',menu)
+        for false_claim in ('：正常','：在线','：Primary'):
+            self.assertNotIn(false_claim,menu)
+        result=self.run_cli('--dry-run',text='6\n3\n\n0\n0\n')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('"primary": null',result.stdout)
+
+    def compatibility_panel(self):
+        # Execute the retained read-only observer, never acquire new observations.
+        result=subprocess.run(['python3','-B',str(self.root/'modules/dashboard.py')],env=self.env,capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr)
+        return result.stdout
 
     def test_interval_preserves_config_and_lock(self):
         before=self.conf.read_text()
