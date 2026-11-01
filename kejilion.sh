@@ -11286,7 +11286,7 @@ EOF
               echo '检测到远程与本地内容不同。更新会覆盖本地清理规则。'
               echo '远程文件在/beifen/beifen.sh'
               echo '1. 继续使用本地文件（默认）'
-              echo '2. 更新为远程文件）'
+              echo '2. 更新为远程文件'
               echo '0. 返回上一级'
               IFS= read -r -p '请选择 [默认1]：' script_choice || exit 0
               case "${script_choice:-1}" in
