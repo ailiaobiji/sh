@@ -11283,10 +11283,13 @@ EOF
             elif cmp -s -- "$local_script" "$tmp_script"; then
               echo '本地与远程内容一致，无需更新。'
             else
+              echo -e "${gl_kjlan}------------------------${gl_bai}"
               echo '检测到远程与本地内容不同。更新会覆盖本地清理规则。'
               echo '远程文件在/beifen/beifen.sh'
+              echo -e "${gl_kjlan}------------------------${gl_bai}"
               echo '1. 继续使用本地文件（默认）'
               echo '2. 更新为远程文件'
+              echo -e "${gl_kjlan}------------------------${gl_bai}"
               echo '0. 返回上一级'
               IFS= read -r -p '请选择 [默认1]：' script_choice || exit 0
               case "${script_choice:-1}" in
