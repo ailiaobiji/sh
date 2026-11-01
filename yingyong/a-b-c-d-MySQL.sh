@@ -621,6 +621,37 @@ POLICY_DRY_RUN 是恢复策略部署闸门，区别于 CLI --dry-run；后者控
 
 @@ABC_END
 
+@@ABC_FILE docs/CLOUDFLARE-TRANSACTIONS.md 600 5163d3acdf52959289fe3da65028d38a3c9472828fbc930b06283192996432d1
+# Cloudflare本地配置事务（第二批第二项）
+
+只处理本地配置，不访问Cloudflare API，不修改DNS。
+
+## 唯一发布器
+modules/config_transaction.py：Cloudflare.update及旧monitor --interval均经过config/config-write.lock，使用完整config.env摘要CAS、operation_id+受保护HMAC请求指纹、单调账本版本。旧Cloudflare无参数入口仍为阻断预览，不存在旧真实DNS写能力。旧脚本新增--recover，只在两次严格yes后恢复本地事务。
+
+配置唯一活动来源仍为config/config.env。config/config-pending.env为0600受控恢复候选，不是独立活动配置；候选含凭据，仅存私有config目录，不能当作普通日志或公开证据。config-request.key为0600随机HMAC密钥，账本不保存Token/密码/私钥。原cloudflare-history.json仅保留读取，不删除、不迁移；新历史从config-ledger.json读取，两种记录合并展示。
+
+## 协议
+1. 固定字段/格式校验，持唯一配置锁，先恢复既有事务。
+2. 同operation_id同完整请求返回已记录结果，异请求同ID拒绝；未指定ID的旧Python调用兼容生成随机ID，调用方必须保存返回ID及原请求才能可靠重试。
+3. 在私有暂存目录调用原common.sh load_config验证完整候选，原文不输出；然后核对原配置SHA256版本。
+4. 候选配置原子写/fsync，写PREPARED意图：前后配置摘要、前后账本摘要、完整脱敏目标账本。
+5. 恢复器仅在当前配置和账本分别匹配before/after时继续，原子发布配置，再原子发布账本，再COMMITTED。未知外部更新一律拒绝，不盲目覆盖。
+6. 读取状态/历史不自动恢复；已有锁采用共享锁，PREPARED明确报未完成。物理上多个文件不是一次原子替换，逻辑上只有COMMITTED才能报告完成。
+
+恢复命令：bash scripts/cloudflare.sh --recover。配置已发布但账本失败时可运行此命令；如果非合作外部写者更新了配置，保留材料等待人工核对，不自动强制回滚。
+
+## 已知边界
+- 普通Shell bootstrap和worker仍直接读config.env：会读到原子完整的旧/新配置，但不是配置+审计跨文件快照；不能把它描述为所有读者都受同一锁保护。
+- 旧monitor interval调用生成随机operation_id；需显式稳定ID重试时使用ConfigTransaction接口，本批未新增监控UI协议。
+- 读取前首次尚无锁时不创建锁，存在首次写者竞态；配置单文件原子但完整历史快照仍可拒绝/稍后重试，不承诺读取跨文件强串行。
+- 本地flock不能防root手工修改；恢复按摘要拒绝外部更新。HMAC不是加密或防篡改审计能力，文件权限不隔绝root。
+- 重要旧历史不重写。新账本按整体JSON原子更新，长期增长和失败拒绝审计另需后续设计；不在本批实施日志轮转。
+- 保留私有候选以便故障恢复，提交后不清空；删除配置后候选为删除后的配置，历史/账本不保存旧Token。不能承诺安全擦除磁盘旧块。
+- 测试中的SIGKILL/ENOSPC注入不是生产通信、真实磁盘耗尽或整机断电证明。
+
+@@ABC_END
+
 @@ABC_FILE docs/DISTRIBUTION.md 600 2449173ff9b3c918f0d0c87c73d15d8d064dadd59769b3969557329dee5b3cee
 # 自包含分发入口
 
@@ -640,7 +671,7 @@ POLICY_DRY_RUN 是恢复策略部署闸门，区别于 CLI --dry-run；后者控
 
 @@ABC_END
 
-@@ABC_FILE docs/DOMAIN-TRANSACTIONS.md 600 aab518fa81b6bb534347982a69ef83a8e5b4fd5b4e9fe0d235a549fd62937455
+@@ABC_FILE docs/DOMAIN-TRANSACTIONS.md 600 8f8b895bee1f79fbd359488cbc969b8cba51c233e4db01c9004148adaa5a5272
 # 第二批第一项：分域离线事务
 
 ## 本次范围
@@ -668,6 +699,15 @@ POLICY_DRY_RUN 是恢复策略部署闸门，区别于 CLI --dry-run；后者控
 同域PREPARED/发布中断由同请求重试恢复；只读菜单发现未提交事务明确拒绝，不自动改状态；其他域可独立提交，恢复只发布目标域，不覆盖另一域更新。初始化marker前中断保留材料，拒绝重新初始化，需人工处理。
 
 本次不提供旧状态自动迁移，不宣称断电持久化、分布式锁/租约、真实监控权威、真实Fencing或MySQL切换。
+
+## 第一项续审结论
+保留commit.lock。跨域colocation、物理生命周期和PREPARED意图需要共同线性化校验，否则两个独立快照各自合法、合并后可能非法。简单按动作放行或CAS两次读后各自写会发生write skew；按节点资源预留或不可变版本快照协议可替代，但属于重大协议设计，不在本次直接引入。
+
+阻塞范围包括本地组合读取、schema/资格校验、日志意图及状态发布的fsync；不包含用户输入、远程操作或整个迁移任务。不能保证磁盘卡顿时等待有上限。真实子进程持门测试证明对侧提交等待、释放后完成。依然不是完全无共享锁实现。
+
+续审修复：公开recover统一获取域锁→提交锁；读取审计拒绝PREPARED及版本不匹配；恢复重验跨域兼任约束；新提交同时验证对侧PREPARED after镜像，避免登记退役/资源策略变化破坏稍后恢复。域审计与状态同文件原子发布，尚未独立追加存储。
+
+新增test_domain_crashes.py：实际子进程分别在生产/监控PREPARED及状态发布完成后停住，再SIGKILL；对侧提交后重启恢复并比对对侧文件摘要。另测ENOSPC、恢复拒绝冲突状态、挂起监控绑定阻止物理退役和共享锁阻塞。进程崩溃测试不代表主机断电或生产容灾验收。
 
 @@ABC_END
 
@@ -850,19 +890,21 @@ A/B/D物理ID不变，promote任一Active候选在同一事务把旧Primary变Re
 
 @@ABC_END
 
-@@ABC_FILE modules/cloudflare_config.py 600 0cd4068160ae9f57d5f52a961ceac9f2d5d3ffb9214e1298f0b3f7e01ab139bd
+@@ABC_FILE modules/cloudflare_config.py 600 39679efd1fc110ecf51c65c4c6c5b15525777369330fe2d8d7da52a03e4d6d95
 """One protected CF configuration: existing config.env; offline checks only."""
-import fcntl
-import hashlib
-import os
 import re
-import time
 from topology_model import Store
 
 class Cloudflare:
     def __init__(self,root):
         self.io=Store(root);self.io.folder=self.io.root/'config'
     def read(self):
+        from config_transaction import ConfigTransaction
+        tx=ConfigTransaction(self.io.root)
+        with tx.locked(readonly=True):
+            tx.pending()
+            return self._read()
+    def _read(self):
         p=self.io.folder/'config.env';self.io.private(p)
         raw=p.read_text();values={}
         for line in raw.splitlines():
@@ -878,37 +920,23 @@ class Cloudflare:
         _,v=self.read();t=v.get('CF_API_TOKEN','');z=v.get('CF_ZONE_ID','');d=v.get('CF_DOMAIN','')
         return dict(mode='OFFLINE_MODEL',token_format=bool(re.fullmatch(r'[A-Za-z0-9_-]{20,256}',t)),zone_format=bool(re.fullmatch(r'[a-fA-F0-9]{32}',z)),domain_format=bool(re.fullmatch(r'(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}',d)),permissions='无法确认；需未来只读API权限实测',modified_dns=False)
     def history(self):
-        p=self.io.folder/'cloudflare-history.json'
-        return self.io.read(p.name) if p.exists() or p.is_symlink() else []
-    def update(self,changes,expected):
+        from config_transaction import ConfigTransaction
+        tx=ConfigTransaction(self.io.root)
+        with tx.locked(readonly=True):
+            tx.pending()
+            p=self.io.folder/'cloudflare-history.json'
+            old=self.io.read(p.name) if p.exists() or p.is_symlink() else []
+            return old+[x for x in tx.ledger()['operations'] if x['domain']=='cloudflare']
+    def recover(self):
+        from config_transaction import ConfigTransaction
+        ConfigTransaction(self.io.root).recover()
+    def update(self,changes,expected,operation_id=None):
         if not set(changes)<={'CF_API_TOKEN','CF_ZONE_ID','CF_DOMAIN'}:raise ValueError('禁止修改非CF字段')
         for k,v in changes.items():
             if not isinstance(v,str) or any(ord(c)<32 or ord(c)==127 or c in '"\\' for c in v):raise ValueError('配置输入非法')
             if v and not re.fullmatch({'CF_API_TOKEN':r'[A-Za-z0-9_-]{20,256}','CF_ZONE_ID':r'[a-fA-F0-9]{32}','CF_DOMAIN':r'(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}'}[k],v):raise ValueError('CF字段格式不符合要求（不显示原文）')
-        lock=self.io.folder/'cloudflare.lock'
-        fd=os.open(lock,os.O_CREAT|os.O_WRONLY|os.O_APPEND|os.O_NOFOLLOW,0o600)
-        try:
-            self.io.private(lock);fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            raw,v=self.read()
-            if hashlib.sha256(raw.encode()).hexdigest()!=expected:raise ValueError('配置版本冲突')
-            history=self.history();history.append(dict(at=int(time.time()),fields=sorted(changes),mode='OFFLINE_CONFIG',event='PREPARED'))
-            self.io.write('cloudflare-history.json',history)
-            lines=raw.splitlines(keepends=True)
-            for k,value in changes.items():
-                if k not in v:raise ValueError('统一配置字段缺失，不创建第二份Token')
-                lines=[k+'="'+value+'"\n' if line.startswith(k+'=') else line for line in lines]
-            # Never save token material in logs/audit/ordinary model or argv.
-            import tempfile
-            p=self.io.folder/'config.env';tmpfd,tmp=tempfile.mkstemp(prefix='.cf-',dir=self.io.folder)
-            try:
-                with os.fdopen(tmpfd,'w') as f:f.write(''.join(lines));f.flush();os.fsync(f.fileno())
-                os.replace(tmp,p);parent=os.open(self.io.folder,os.O_RDONLY|os.O_DIRECTORY)
-                try:os.fsync(parent)
-                finally:os.close(parent)
-            finally:
-                if os.path.exists(tmp):os.unlink(tmp)
-            history[-1]['event']='COMMITTED';self.io.write('cloudflare-history.json',history)
-        finally:os.close(fd)
+        from config_transaction import ConfigTransaction
+        return ConfigTransaction(self.io.root).update(changes,expected,operation_id,'cloudflare')
 
 @@ABC_END
 
@@ -1151,6 +1179,155 @@ handle_error() { printf '操作未完成，返回菜单（退出码 %s）。\n' 
 
 @@ABC_END
 
+@@ABC_FILE modules/config_transaction.py 600 a5aac7ed8750b5e3a344a3dd5b0ea00d2a503bcc6a75891300a78ca9fcbb4596
+"""One private config.env publisher. Offline local transactions, no network."""
+from contextlib import contextmanager
+from pathlib import Path
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import subprocess
+import tempfile
+import time
+from topology_model import Store
+
+
+def digest(data):return hashlib.sha256(data).hexdigest()
+
+class ConfigTransaction:
+    def __init__(self,root):
+        self.io=Store(root);self.io.folder=self.io.root/'config'
+    @contextmanager
+    def locked(self,readonly=False):
+        self.io.private(self.io.root,True);self.io.private(self.io.folder,True)
+        p=self.io.folder/'config-write.lock'
+        if readonly and not p.exists() and not p.is_symlink():
+            yield
+            return
+        fd=os.open(p,(0 if readonly else os.O_CREAT)|os.O_APPEND|os.O_WRONLY|os.O_NOFOLLOW,0o600)
+        try:
+            self.io.private(p);fcntl.flock(fd,(fcntl.LOCK_SH if readonly else fcntl.LOCK_EX)|fcntl.LOCK_NB);yield
+        finally:os.close(fd)
+    def raw(self):
+        p=self.io.folder/'config.env';self.io.private(p);return p.read_bytes()
+    def atomic(self,name,content):
+        p=self.io.folder/name
+        if p.exists() or p.is_symlink():self.io.private(p)
+        fd,tmp=tempfile.mkstemp(prefix='.config-',dir=self.io.folder)
+        try:
+            with os.fdopen(fd,'wb') as f:f.write(content);f.flush();os.fsync(f.fileno())
+            os.replace(tmp,p);self.sync()
+        finally:
+            if os.path.exists(tmp):os.unlink(tmp)
+    def sync(self):
+        fd=os.open(self.io.folder,os.O_RDONLY|os.O_DIRECTORY)
+        try:os.fsync(fd)
+        finally:os.close(fd)
+    def ledger(self):
+        p=self.io.folder/'config-ledger.json'
+        d=self.io.read(p.name) if p.exists() or p.is_symlink() else dict(schema=1,version=0,operations=[])
+        return self.validate_ledger(d)
+    def validate_ledger(self,d):
+        if not isinstance(d,dict) or set(d)!={'schema','version','operations'} or d['schema']!=1 or type(d['version']) is not int or not isinstance(d['operations'],list) or len(d['operations'])!=d['version']:raise ValueError('配置账本损坏')
+        ids=[]
+        for i,x in enumerate(d['operations'],1):
+            if not isinstance(x,dict) or set(x)!={'operation_id','fingerprint','domain','fields','timestamp','before_version','after_version','event'} or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',x.get('operation_id','')) or not re.fullmatch(r'[a-f0-9]{64}',x.get('fingerprint','')) or x['domain'] not in ('cloudflare','monitor') or x['before_version']!=i-1 or x['after_version']!=i or x['event']!='COMMITTED' or not isinstance(x['fields'],list):raise ValueError('配置审计损坏')
+            ids.append(x['operation_id'])
+        if len(ids)!=len(set(ids)):raise ValueError('配置请求ID重复')
+        return d
+    def pending(self):
+        p=self.io.folder/'config-transaction.json'
+        if p.exists() or p.is_symlink():
+            j=self.io.read(p.name)
+            if not isinstance(j,dict) or set(j)!={'status','version'} or j.get('status')!='COMMITTED' or j.get('version')!=self.ledger()['version']:raise ValueError('配置事务未完成；需显式恢复，不报告成功')
+    def validate(self,raw):
+        # Exact common parser, bounded private staging; never source config as code.
+        with tempfile.TemporaryDirectory(prefix='config-validation-',dir=self.io.root/'tmp') as temp:
+            p=Path(temp);(p/'config').mkdir(mode=0o700)
+            data=raw.decode().replace(str(self.io.root),str(p));(p/'config/config.env').write_text(data);(p/'config/config.env').chmod(0o600)
+            result=subprocess.run(['bash','-c','source "$1"; PROJECT_DIR=$2; load_config','_',str(self.io.root/'modules/common.sh'),str(p)],capture_output=True,timeout=15)
+            if result.returncode:raise ValueError('候选配置未通过统一校验（原文隐藏）')
+    def key(self):
+        p=self.io.folder/'config-request.key'
+        if not p.exists():self.atomic(p.name,secrets.token_bytes(32))
+        self.io.private(p);key=p.read_bytes()
+        if len(key)!=32:raise ValueError('请求指纹密钥损坏')
+        return key
+    def recover(self):
+        with self.locked():self._recover()
+    def _recover(self):
+        p=self.io.folder/'config-transaction.json'
+        if not p.exists() and not p.is_symlink():return
+        j=self.io.read(p.name)
+        if not isinstance(j,dict):raise ValueError('配置事务损坏')
+        if j.get('status')=='COMMITTED':
+            if set(j)!={'status','version'} or self.ledger()['version']!=j['version']:raise ValueError('提交版本不一致')
+            return
+        if set(j)!={'status','before','after','ledger_before','ledger_after','ledger'} or j['status']!='PREPARED':raise ValueError('配置恢复意图损坏')
+        now=digest(self.raw());ledger=self.ledger()
+        if now not in (j['before'],j['after']):raise ValueError('配置已被其他写者更新，禁止恢复覆盖')
+        if digest(json.dumps(ledger,sort_keys=True).encode()) not in (j['ledger_before'],j['ledger_after']):raise ValueError('配置历史已更新，禁止恢复覆盖')
+        desired=j['ledger']
+        if digest(json.dumps(desired,sort_keys=True).encode())!=j['ledger_after'] or desired['version']!=ledger['version']+(0 if ledger==desired else 1):raise ValueError('恢复账本摘要/版本不一致')
+        # Validate desired through the same ledger schema before changing config.
+        self.validate_ledger(desired)
+        if ledger!=desired and desired['operations'][:-1]!=ledger['operations']:raise ValueError('恢复禁止重写既有历史')
+        candidate=self.io.folder/'config-pending.env';self.io.private(candidate);data=candidate.read_bytes()
+        if digest(data)!=j['after']:raise ValueError('候选配置损坏')
+        self.validate(data)
+        if now!=j['after']:self.atomic('config.env',data)
+        self.io.write('config-ledger.json',desired)
+        self.io.write('config-transaction.json',dict(status='COMMITTED',version=desired['version']))
+        # Candidate kept private until next transaction overwrites it; never a second live config.
+
+    def update(self,changes,expected,operation_id=None,domain='cloudflare'):
+        request=operation_id or secrets.token_hex(16)
+        if not isinstance(request,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',request):raise ValueError('operation_id非法')
+        allowed={'CF_API_TOKEN','CF_ZONE_ID','CF_DOMAIN'} if domain=='cloudflare' else {'MONITOR_INTERVAL','STATUS_EXPIRE_SECONDS'} if domain=='monitor' else set()
+        if not isinstance(changes,dict) or not changes or not set(changes)<=allowed:raise ValueError('配置字段越界')
+        for value in changes.values():
+            if not isinstance(value,str) or any(ord(c)<32 or c in '"\\' or ord(c)==127 for c in value):raise ValueError('配置输入非法')
+        if domain=='cloudflare':
+            patterns={'CF_API_TOKEN':r'[A-Za-z0-9_-]{20,256}','CF_ZONE_ID':r'[a-fA-F0-9]{32}','CF_DOMAIN':r'(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}'}
+            if any(v and not re.fullmatch(patterns[k],v) for k,v in changes.items()):raise ValueError('CF字段格式非法（原文隐藏）')
+        with self.locked():
+            self._recover();raw=self.raw();ledger=self.ledger()
+            payload=json.dumps(dict(changes=changes,expected=expected,domain=domain),sort_keys=True).encode();fp=hmac.new(self.key(),payload,hashlib.sha256).hexdigest()
+            prior=next((x for x in ledger['operations'] if x['operation_id']==request),None)
+            if prior:
+                if prior['fingerprint']!=fp:raise ValueError('operation_id已用于不同配置请求')
+                return dict(operation_id=request,version=prior['after_version'],event='COMMITTED')
+            lines=raw.decode().splitlines(keepends=True);seen=set()
+            for k,v in changes.items():
+                for i,line in enumerate(lines):
+                    if line.startswith(k+'='):lines[i]=k+'="'+v+'"\n';seen.add(k)
+                if k not in seen:
+                    if domain!='monitor':raise ValueError('统一CF字段缺失')
+                    lines.append('\n'+k+'="'+v+'"\n')
+            data=''.join(lines).encode();self.validate(data)
+            if digest(raw)!=expected:raise ValueError('配置版本冲突')
+            new=json.loads(json.dumps(ledger));new['version']+=1
+            new['operations'].append(dict(operation_id=request,fingerprint=fp,domain=domain,fields=sorted(changes),timestamp=time.strftime('%Y-%m-%dT%H:%M:%S+00:00',time.gmtime()),before_version=ledger['version'],after_version=new['version'],event='COMMITTED'))
+            self.atomic('config-pending.env',data)
+            self.io.write('config-transaction.json',dict(status='PREPARED',before=digest(raw),after=digest(data),ledger_before=digest(json.dumps(ledger,sort_keys=True).encode()),ledger_after=digest(json.dumps(new,sort_keys=True).encode()),ledger=new))
+            self._recover()
+            return dict(operation_id=request,version=new['version'],event='COMMITTED')
+
+
+if __name__=='__main__':
+    import sys
+    if sys.argv[1:]!=['--recover']:raise SystemExit('仅支持 --recover；不执行DNS操作')
+    try:
+        ConfigTransaction(Path(__file__).resolve().parents[1]).recover()
+        print('本地配置事务恢复完成；未连接Cloudflare或修改DNS。')
+    except (ValueError,OSError,KeyError,TypeError):raise SystemExit('配置恢复安全拒绝；保留材料，错误原文隐藏。')
+
+@@ABC_END
+
 @@ABC_FILE modules/dashboard.py 600 36e7996f0e8e9f8ee5fd7327da7310684a774f0141fb02c9f230d4de31fff0c5
 """ABCD status panel: live observations and offline roles are never conflated."""
 from pathlib import Path
@@ -1230,7 +1407,7 @@ if __name__=='__main__':
 
 @@ABC_END
 
-@@ABC_FILE modules/domain_store.py 600 de82c012636b748c830a462059f1a3259c7d61813a4876dcc7baa7b8ed86ab94
+@@ABC_FILE modules/domain_store.py 600 8d22f3bd6743a4414bedcfd429b3125c59efcad0f86953e84ccba5b4adefaa57
 """Independent local offline transaction domains; no infrastructure executors.
 
 A read-only composed schema3 view preserves existing pure safety decisions.
@@ -1373,18 +1550,32 @@ class DomainStore(PrivateIO):
         with self.locked('commit',exclusive=False,nonblock=False):
             records=self.records()
             for name in DOMAINS:
-                io=self.io(name)
-                if (io.folder/'transaction.json').exists() and io.read('transaction.json').get('status')!='COMMITTED':raise ValueError('分域事务待恢复；菜单只读，不自动重放')
+                self.pending(name)
             return self.compose(records)
     def audit(self,domain):
-        with self.locked('commit',exclusive=False,nonblock=False):return copy.deepcopy(self.records()[domain]['audit'])
+        if domain not in DOMAINS:raise ValueError('未知审计功能域')
+        with self.locked('commit',exclusive=False,nonblock=False):
+            self.pending(domain)
+            return copy.deepcopy(self.records()[domain]['audit'])
+    def pending(self,domain):
+        io=self.io(domain)
+        if (io.folder/'transaction.json').exists():
+            j=io.read('transaction.json')
+            if not isinstance(j,dict) or j.get('domain')!=domain:raise ValueError('事务功能域损坏')
+            if j.get('status')!='COMMITTED':raise ValueError('功能域事务待恢复，禁止作为已提交审计读取')
+            if set(j)!={'status','domain','version'} or type(j.get('version')) is not int or self.validate_record(io.read('state.json'),domain)['version']!=j['version']:raise ValueError('提交标记与状态版本不一致')
     def recover(self,domain):
+        # Public recovery obeys the same lock order as a transaction.
+        with self.locked(domain):
+            with self.locked('commit',nonblock=False):self._recover_locked(domain)
+    def _recover_locked(self,domain):
         io=self.io(domain);p=io.folder/'transaction.json'
         if not p.exists():return
         j=io.read('transaction.json')
         if not isinstance(j,dict) or j.get('domain')!=domain:raise ValueError('跨功能域或损坏事务，拒绝恢复')
         if j.get('status')=='COMMITTED':
             if set(j)!={'status','domain','version'} or type(j['version']) is not int:raise ValueError('提交标记损坏')
+            if self.validate_record(io.read('state.json'),domain)['version']!=j['version']:raise ValueError('提交标记与状态版本不一致')
             return
         if set(j)!={'status','domain','before','before_digest','after','after_digest'} or j['status']!='PREPARED':raise ValueError('未知分域事务')
         after=self.validate_record(j['after'],domain)
@@ -1393,7 +1584,7 @@ class DomainStore(PrivateIO):
         if current['version']==after['version']:
             if current!=after:raise ValueError('同版本状态不一致')
         elif current['version']!=j['before'] or fingerprint(current)!=j['before_digest']:raise ValueError('恢复禁止覆盖已更新状态')
-        candidate=copy.deepcopy(records);candidate[domain]=after;self.compose(candidate)
+        candidate=copy.deepcopy(records);candidate[domain]=after;self.check_combination(candidate)
         io.write('state.json',after);io.write('transaction.json',dict(status='COMMITTED',domain=domain,version=after['version']))
     def transaction(self,request,expected,action,node,fields=None,interrupt=None):
         fields=copy.deepcopy(fields or {});domain=classify(action,fields)
@@ -1405,7 +1596,7 @@ class DomainStore(PrivateIO):
             # Brief cross-domain validation/publication gate; no migration phase
             # execution or user interaction ever takes place inside this gate.
             with self.locked('commit',nonblock=False):
-                self.recover(domain);records=self.records();old=records[domain]
+                self._recover_locked(domain);records=self.records();old=records[domain]
                 payload=dict(domain=domain,expected=expected,action=action,node=node,fields=fields)
                 fp=fingerprint(payload);prior=next((p for p in old['operations'] if p['operation_id']==request),None)
                 if prior:
@@ -1425,13 +1616,35 @@ class DomainStore(PrivateIO):
                 new=copy.deepcopy(old);new['state']=self.project(updated,domain);new['version']+=1;new['generation']+=1
                 new['operations'].append(dict(operation_id=request,fingerprint=fp))
                 new['audit'].append(dict(timestamp=time.strftime('%Y-%m-%dT%H:%M:%S+00:00',time.gmtime()),operation_id=request,domain=domain,action=action,before_version=old['version'],after_version=new['version'],result='OFFLINE_COMMITTED',reason_code=None,source='local-offline-model'))
-                self.validate_record(new,domain);records[domain]=new;result=self.compose(records)
+                self.validate_record(new,domain);records[domain]=new;result=self.check_combination(records)
+                # A PREPARED opposite-domain intent reserves its safety result.
+                # Check all pending after-images before publishing this domain,
+                # so later recovery cannot violate colocation/lifecycle rules.
+                pending_records=copy.deepcopy(records)
+                for other in DOMAINS:
+                    if other==domain:continue
+                    other_io=self.io(other)
+                    if (other_io.folder/'transaction.json').exists():
+                        journal=other_io.read('transaction.json')
+                        if not isinstance(journal,dict) or journal.get('domain')!=other:raise ValueError('对侧事务损坏')
+                        if journal.get('status')=='PREPARED':
+                            after=self.validate_record(journal['after'],other)
+                            if fingerprint(after)!=journal.get('after_digest'):raise ValueError('对侧恢复镜像摘要损坏')
+                            pending_records[other]=after
+                        elif journal.get('status')!='COMMITTED':raise ValueError('对侧事务状态未知')
+                self.check_combination(pending_records)
                 io=self.io(domain);io.write('transaction.json',dict(status='PREPARED',domain=domain,before=old['version'],before_digest=fingerprint(old),after=new,after_digest=fingerprint(new)))
                 if interrupt=='prepared':raise InterruptedError('分域PREPARED中断')
                 io.write('state.json',new)
                 if interrupt=='published':raise InterruptedError('分域发布后中断')
                 io.write('transaction.json',dict(status='COMMITTED',domain=domain,version=new['version']))
                 return result
+    def check_combination(self,records):
+        from node_functions import conflicts
+        d=self.compose(records)
+        problems=conflicts(d)
+        if problems:raise ValueError('跨域组合资格冲突：'+';'.join(problems))
+        return d
 
 @@ABC_END
 
@@ -1840,7 +2053,7 @@ def change(d,action,node,f):
 
 @@ABC_END
 
-@@ABC_FILE modules/management_ui.py 600 567211ebac949950a17de3705ec44784ecda3db19e068c5f7268412853f44a38
+@@ABC_FILE modules/management_ui.py 600 f4efe8efc744e73a0f5e9abf31d775c1ac89a05feefb60a1ed98c761d074fe1a
 """Formal stage-two UI. All observations and submissions explicitly offline.
 No subprocess/network executors. Ctrl-D/:quit cancels without staged writes.
 """
@@ -2004,7 +2217,8 @@ class UI:
         show(dict(fields=sorted(changes),token='隐藏；不输出',impact='仅统一受保护配置；不修改DNS'))
         if self.dry:print('Dry-run：未写配置。');return
         if ask('第一次确认，输入yes：')!='yes' or ask('第二次确认，输入yes：')!='yes':raise Cancel()
-        cf.update(changes,hashlib.sha256(raw.encode()).hexdigest());print('受保护配置已更新；未修改真实DNS。')
+        request=ask('Cloudflare operation_id（留空生成）：') or uuid.uuid4().hex
+        cf.update(changes,hashlib.sha256(raw.encode()).hexdigest(),request);print('受保护配置已更新；未修改真实DNS。operation_id='+request)
     def bindings(self,key,c):
         d=self.load();m=settings(d)
         if key=='3':
@@ -2212,7 +2426,7 @@ CHILDREN={('7',22):'7c',('9',2):'9s',('9',3):'9t',('9',4):'9p',('9',5):'9m',('9'
 
 @@ABC_END
 
-@@ABC_FILE modules/monitor_engine.py 600 734bbb85beb30dd411b46d2499fe8d5023b2c2078a8796975c8aa97f29ba7900
+@@ABC_FILE modules/monitor_engine.py 600 f2bcb2186a741e07afce5e5765dd986d6ff2dacd1b2e1077c6f1c2facd825000
 #!/usr/bin/env python3
 """C-only monitoring: bounded read-only SSH, private snapshots/history, no data-plane writes."""
 from concurrent.futures import ThreadPoolExecutor
@@ -2473,37 +2687,10 @@ def interval(value):
         raise ValueError('检查间隔需为 5—3600 秒整数')
     timeout = int(os.environ['MONITOR_TIMEOUT'])
     expiry = max(30, int(value) + timeout + 2)
-    fd = lock('monitor-config.lock')
-    try:
-        path = ROOT / 'config/config.env'
-        text = path.read_text()
-        for key, val in (('MONITOR_INTERVAL', value), ('STATUS_EXPIRE_SECONDS', str(expiry))):
-            pattern = r'^' + key + r'="[^"\n]*"$'
-            if re.search(pattern, text, re.M): text = re.sub(pattern, key + '="' + val + '"', text, flags=re.M)
-            else: text += '\n' + key + '="' + val + '"\n'
-        # Validate staged configuration using the exact shared parser in a subprocess.
-        temporary = ROOT / 'tmp' / ('config-check-' + str(os.getpid()))
-        temporary.mkdir(mode=0o700)
-        try:
-            (temporary / 'config').mkdir(mode=0o700)
-            (temporary / 'config/config.env').write_text(text.replace(str(ROOT), str(temporary)))
-            (temporary / 'config/config.env').chmod(0o600)
-            check = subprocess.run(['bash', '-c', 'source "$1"; PROJECT_DIR=$2; load_config', '_', str(ROOT/'modules/common.sh'), str(temporary)], capture_output=True)
-            if check.returncode: raise ValueError('新配置未通过统一校验')
-        finally:
-            (temporary/'config/config.env').unlink(); (temporary/'config').rmdir(); temporary.rmdir()
-        # atomic expects a JSON value; config publication is separately byte-oriented.
-        fd2, name = tempfile.mkstemp(prefix='.config-monitor-', dir=path.parent)
-        try:
-            with os.fdopen(fd2, 'w') as stream: stream.write(text); stream.flush(); os.fsync(stream.fileno())
-            os.replace(name, path)
-            fd_dir = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try: os.fsync(fd_dir)
-            finally: os.close(fd_dir)
-        finally:
-            if os.path.exists(name): os.unlink(name)
-        print('已保存间隔 ' + value + ' 秒；有效期 ' + str(expiry) + ' 秒。后台每轮重新加载配置，无需重复创建任务。')
-    finally: os.close(fd)
+    from config_transaction import ConfigTransaction,digest
+    tx=ConfigTransaction(ROOT)
+    tx.update({'MONITOR_INTERVAL':value,'STATUS_EXPIRE_SECONDS':str(expiry)},digest(tx.raw()),domain='monitor')
+    print('已保存间隔 ' + value + ' 秒；有效期 ' + str(expiry) + ' 秒。后台每轮重新加载配置，无需重复创建任务。')
 
 
 def worker():
@@ -3582,12 +3769,22 @@ log_event CHECK || exit 1
 
 @@ABC_END
 
-@@ABC_FILE scripts/cloudflare.sh 700 be46669c8c0ee917866728f7a212c518b340eb1b453e677897ceb21141de9533
+@@ABC_FILE scripts/cloudflare.sh 700 c4f655055eb3ad79b72eade446f2477a3d9cf6a172644ecce4753a4ed07ffac1
 #!/usr/bin/env bash
 # shellcheck source=../modules/common.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/../modules/common.sh"
 [[ ${1:-} != --dry-run ]] || DRY_RUN=true
 bootstrap || exit 1
+if [[ $# == 1 && $1 == --recover ]]; then
+    echo '仅恢复本地统一配置事务，不连接Cloudflare或修改DNS。'
+    printf '第一次确认，输入yes：'
+    IFS= read -r answer || exit 1
+    [[ $answer == yes ]] || exit 1
+    printf '第二次确认，输入yes：'
+    IFS= read -r answer || exit 1
+    [[ $answer == yes ]] || exit 1
+    exec python3 -B "$PROJECT_DIR/modules/config_transaction.py" --recover
+fi
 [[ $# -eq 0 || ( $# -eq 1 && $1 == --dry-run ) ]] || { die '未知模块参数'; exit 2; }
 blocked_module 'Cloudflare 免费 DNS 配置'
 
@@ -4489,6 +4686,97 @@ if __name__=='__main__':
 
 @@ABC_END
 
+@@ABC_FILE tests/test_cf_transactions.py 600 a00b9942dd2a7f043efe554a67c71e8ed45c47104292add8495e9848acf77840
+"""CF config transactions: real local races/crashes and fault injection."""
+import sys,os,json,subprocess,select,errno
+from unittest.mock import patch
+import unittest
+from test_framework import FrameworkTests,SOURCE
+sys.path.insert(0,str(SOURCE/'modules'))
+from cloudflare_config import Cloudflare
+from config_transaction import ConfigTransaction,digest
+
+class CFTests(FrameworkTests):
+ def tx(self):return ConfigTransaction(self.root)
+ def version(self):return digest(self.tx().raw())
+ def test_idempotency_and_conflict(self):
+  cf=Cloudflare(self.root);v=self.version();a=cf.update({'CF_DOMAIN':'example.com'},v,'same');self.assertEqual(cf.update({'CF_DOMAIN':'example.com'},v,'same'),a);self.assertEqual(len(cf.history()),1)
+  with self.assertRaises(ValueError):cf.update({'CF_DOMAIN':'other.com'},v,'same')
+  with self.assertRaises(ValueError):cf.update({'CF_DOMAIN':'other.com'},v,'different')
+ def test_real_two_process_same_version(self):
+  v=self.version();code="from cloudflare_config import Cloudflare;import sys;Cloudflare(sys.argv[1]).update({'CF_DOMAIN':sys.argv[2]},sys.argv[3],sys.argv[4])"
+  ps=[subprocess.Popen([sys.executable,'-B','-c',code,str(self.root),domain,v,'op'+str(i)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=dict(self.env,PYTHONPATH=str(SOURCE/'modules'))) for i,domain in enumerate(('one.com','two.com'))]
+  codes=[]
+  for p in ps:p.communicate(timeout=20);codes.append(p.returncode)
+  self.assertEqual(sum(c==0 for c in codes),1);self.assertEqual(len(Cloudflare(self.root).history()),1)
+ def crash(self,phase,recover=False):
+  code="""from config_transaction import ConfigTransaction
+from cloudflare_config import Cloudflare
+import sys
+s=ConfigTransaction(sys.argv[1]);phase=sys.argv[2];original=s.io.write;atomic=s.atomic
+# Durable checkpoints on real filesystem.
+def write(name,value):
+ original(name,value)
+ if (phase=='prepared' and name=='config-transaction.json' and value.get('status')=='PREPARED') or (phase=='audit' and name=='config-ledger.json'):
+  print('READY',flush=True);sys.stdin.readline()
+def publish(name,value):
+ atomic(name,value)
+ if phase=='published' and name=='config.env':print('READY',flush=True);sys.stdin.readline()
+s.io.write=write;s.atomic=publish
+if sys.argv[3]=='recover':s.recover()
+else:s.update({'CF_DOMAIN':'example.com'},sys.argv[4],'crash')
+"""
+  p=subprocess.Popen([sys.executable,'-B','-c',code,str(self.root),phase,'recover' if recover else 'update',self.version()],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(self.env,PYTHONPATH=str(SOURCE/'modules')))
+  self.assertTrue(select.select([p.stdout],[],[],20)[0]);line=p.stdout.readline().strip();self.assertEqual(line,'READY');p.kill();p.communicate(timeout=10);self.assertEqual(p.returncode,-9)
+ def test_kill_prepared_and_recovery_killed_again(self):
+  self.crash('prepared');self.crash('published',True);self.tx().recover();self.assertEqual(Cloudflare(self.root).status()['domain'],'example.com');self.assertEqual(len(Cloudflare(self.root).history()),1)
+ def test_kill_after_config_before_audit(self):
+  self.crash('published');self.tx().recover();self.assertEqual(len(Cloudflare(self.root).history()),1)
+ def test_kill_after_audit_before_commit(self):
+  self.crash('audit');self.tx().recover();self.assertEqual(len(Cloudflare(self.root).history()),1)
+ def test_history_failure_then_recovery(self):
+  tx=self.tx();old=tx.io.write
+  def fail(name,v):
+   if name=='config-ledger.json':raise OSError(errno.ENOSPC,'injected')
+   old(name,v)
+  with patch.object(tx.io,'write',side_effect=fail):
+   with self.assertRaises(OSError):tx.update({'CF_DOMAIN':'example.com'},self.version(),'disk')
+  with self.assertRaises(ValueError):Cloudflare(self.root).status()
+  tx.recover();self.assertEqual(len(Cloudflare(self.root).history()),1)
+ def test_no_overwrite_external_change(self):
+  self.crash('prepared');p=self.root/'config/config.env';p.write_text(p.read_text().replace('CF_DOMAIN=""','CF_DOMAIN="external.com"'));before=p.read_bytes()
+  with self.assertRaises(ValueError):self.tx().recover()
+  self.assertEqual(before,p.read_bytes())
+ def test_permissions_and_disk_failure(self):
+  p=self.root/'config/config.env';p.chmod(0o644)
+  with self.assertRaises(ValueError):Cloudflare(self.root).update({'CF_DOMAIN':'example.com'},'x','bad')
+  p.chmod(0o600);before=p.read_bytes();tx=self.tx()
+  with patch.object(tx,'atomic',side_effect=OSError(errno.ENOSPC,'injected')):
+   with self.assertRaises(OSError):tx.update({'CF_DOMAIN':'example.com'},self.version(),'full')
+  self.assertEqual(before,p.read_bytes())
+ def test_monitor_and_cf_shared_publisher(self):
+  cf=Cloudflare(self.root);cf.update({'CF_DOMAIN':'example.com'},self.version(),'cf');tx=self.tx();tx.update({'MONITOR_INTERVAL':'40','STATUS_EXPIRE_SECONDS':'60'},self.version(),'monitor','monitor');self.assertEqual(cf.status()['domain'],'example.com');self.assertEqual(len(tx.ledger()['operations']),2)
+  p=self.run_cli('--interval','45',script='scripts/monitor.sh');self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(cf.status()['domain'],'example.com')
+ def test_delete_and_secret_free_audit(self):
+  cf=Cloudflare(self.root);cf.update({'CF_API_TOKEN':'SENSITIVE_SENTINEL_123456789'},self.version(),'token');self.assertNotIn('SENSITIVE_SENTINEL',json.dumps(cf.history())+json.dumps(cf.status()));cf.update({'CF_API_TOKEN':'','CF_ZONE_ID':'','CF_DOMAIN':''},self.version(),'delete');self.assertEqual(cf.status()['token'],'未配置')
+ def test_old_cli_no_config_change(self):
+  before=self.conf.read_bytes();p=self.run_cli(script='scripts/cloudflare.sh');self.assertEqual(p.returncode,3);self.assertEqual(before,self.conf.read_bytes())
+ def test_recovery_cli_double_confirmation(self):
+  self.crash('published');p=self.run_cli('--recover',script='scripts/cloudflare.sh',text='yes\nyes\n');self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(Cloudflare(self.root).status()['domain'],'example.com')
+ def test_old_monitor_cli_racing_new_cf(self):
+  code="from cloudflare_config import Cloudflare;from config_transaction import ConfigTransaction,digest;import sys;c=Cloudflare(sys.argv[1]);c.update({'CF_DOMAIN':'example.com'},digest(ConfigTransaction(sys.argv[1]).raw()),'race-cf')"
+  p=subprocess.Popen([sys.executable,'-B','-c',code,str(self.root)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=dict(self.env,PYTHONPATH=str(SOURCE/'modules')))
+  monitor=self.run_cli('--interval','50',script='scripts/monitor.sh');p.communicate(timeout=20)
+  # A losing request may be refused; retry from latest state must preserve both.
+  if p.returncode:Cloudflare(self.root).update({'CF_DOMAIN':'example.com'},self.version(),'retry-cf')
+  if monitor.returncode:self.assertEqual(self.run_cli('--interval','50',script='scripts/monitor.sh').returncode,0)
+  self.assertEqual(Cloudflare(self.root).status()['domain'],'example.com');self.assertIn('MONITOR_INTERVAL="50"',self.conf.read_text())
+
+if __name__=='__main__':
+ r=unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(CFTests(n) for n in CFTests.__dict__ if n.startswith('test_')));raise SystemExit(not r.wasSuccessful())
+
+@@ABC_END
+
 @@ABC_FILE tests/test_colors.py 600 6194e8b00c35d9d16052922feec7c04ad55907ac89af07e7f5d57f1a445365f9
 #!/usr/bin/env python3
 import importlib.util
@@ -4576,6 +4864,97 @@ for version in ('12','13'):
     finally:
         run(['docker','rm','-f',name])
 (root/'data/distribution-verification.txt').write_text('\n'.join(logs))
+
+@@ABC_END
+
+@@ABC_FILE tests/test_domain_crashes.py 600 5e7706c502ec56758171fe92d1077f123d06f18fc8d9f540d4d61c1df0dd5ee9
+"""Real local subprocess crashes and offline fault injection, never production."""
+import errno
+import json
+import os
+import subprocess
+import sys
+import unittest
+from unittest.mock import patch
+from test_domains import DomainTests,SOURCE
+from domain_store import DOMAINS
+
+class CrashTests(DomainTests):
+ def worker(self,domain,phase):
+  version={n:r['version'] for n,r in self.ds.records().items()}
+  code="""import sys,json,time
+from domain_store import DomainStore
+s=DomainStore(sys.argv[1]);domain=sys.argv[2];phase=sys.argv[3];original=s.io
+# Inject a checkpoint after durable real filesystem publication, not before it.
+def factory(name):
+ io=original(name);write=io.write
+ def wrapped(path,value):
+  write(path,value)
+  if name==domain and ((phase=='prepared' and path=='transaction.json' and value.get('status')=='PREPARED') or (phase=='published' and path=='state.json')):
+   print('CHECKPOINT',flush=True);sys.stdin.readline()
+ io.write=wrapped;return io
+s.io=factory
+fields={'production_priority':list('DCBA')} if domain=='production' else {'monitor_priority':list('CBA')}
+s.transaction('kill-'+domain+'-'+phase,json.loads(sys.argv[4]),'priorities','A',fields)
+"""
+  p=subprocess.Popen([sys.executable,'-B','-c',code,str(self.root),domain,phase,json.dumps(version)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(self.env,PYTHONPATH=str(SOURCE/'modules')))
+  import select
+  self.assertTrue(select.select([p.stdout],[],[],10)[0],'checkpoint timeout')
+  self.assertEqual(p.stdout.readline().strip(),'CHECKPOINT');p.kill();stdout,stderr=p.communicate(timeout=10);self.assertEqual(p.returncode,-9)
+  return version
+ def test_process_kill_all_domain_publication_boundaries(self):
+  self.ready()
+  for domain in ('production','monitoring'):
+   for phase in ('prepared','published'):
+    with self.subTest(domain=domain,phase=phase):
+     v=self.worker(domain,phase);other='monitoring' if domain=='production' else 'production'
+     fields={'monitor_priority':list('ABC')} if other=='monitoring' else {'production_priority':list('ABCD')}
+     self.ds.transaction('opposite-'+domain+'-'+phase,v,'priorities','A',fields)
+     digest=self.digest(other);self.ds.recover(domain);self.assertEqual(digest,self.digest(other));d=self.ds.load()
+     self.assertEqual(d['domain_versions'][domain],v[domain]+1)
+     intended={'production_priority':list('DCBA')} if domain=='production' else {'monitor_priority':list('CBA')}
+     before=self.digest(domain);self.ds.transaction('kill-'+domain+'-'+phase,v,'priorities','A',intended);self.assertEqual(before,self.digest(domain))
+ def test_prepared_audit_not_reported_committed(self):
+  self.ready();v=self.ds.load()['domain_versions']
+  with self.assertRaises(InterruptedError):self.ds.transaction('pending',v,'priorities','A',{'monitor_priority':list('CBA')},'published')
+  with self.assertRaises(ValueError):self.ds.audit('monitoring')
+  self.ds.recover('monitoring');self.assertEqual(self.ds.audit('monitoring')[-1]['operation_id'],'pending')
+ def test_pending_intent_blocks_conflicting_registry_policy(self):
+  self.setup_domains()
+  self.tx('register','C',dict(identity='id-C',address='host-C',remark='C'))
+  self.tx('qualify','C',dict(identity_verified=True,data_verified=True,resources=self.resources()))
+  # No production function: a pending monitor binding must still reserve Active.
+  v=self.ds.load()['domain_versions']
+  with self.assertRaises(InterruptedError):self.ds.transaction('monitor-intent',v,'monitor_bind','C',dict(slot='A',profile=self.profile()),'prepared')
+  old=self.digest('registry')
+  with self.assertRaises(ValueError):self.ds.transaction('retire',v,'retire','C',{})
+  self.assertEqual(old,self.digest('registry'));self.ds.recover('monitoring');self.assertEqual(self.ds.load()['nodes']['C']['monitor'],'Backup Monitor')
+ def test_enospc_before_intent_keeps_domains(self):
+  self.ready();before={n:self.digest(n) for n in DOMAINS};version=self.ds.load()['domain_versions']
+  from topology_model import Store
+  with patch.object(Store,'write',side_effect=OSError(errno.ENOSPC,'injected disk full')):
+   with self.assertRaises(OSError):self.ds.transaction('full',version,'priorities','A',{'production_priority':list('DCBA')})
+  self.assertEqual(before,{n:self.digest(n) for n in DOMAINS})
+ def test_commit_gate_blocks_then_releases(self):
+  self.ready();v=self.ds.load()['domain_versions']
+  code="from domain_store import DomainStore;import sys,json;s=DomainStore(sys.argv[1]);print('START',flush=True);s.transaction('wait',json.loads(sys.argv[2]),'priorities','A',{'monitor_priority':list('CBA')});print('DONE',flush=True)"
+  with self.ds.locked('commit'):
+   p=subprocess.Popen([sys.executable,'-B','-c',code,str(self.root),json.dumps(v)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(self.env,PYTHONPATH=str(SOURCE/'modules')))
+   self.assertEqual(p.stdout.readline().strip(),'START')
+   import select
+   self.assertFalse(select.select([p.stdout],[],[],0.2)[0]);self.assertIsNone(p.poll())
+  stdout,stderr=p.communicate(timeout=10);self.assertEqual(p.returncode,0,stderr);self.assertIn('DONE',stdout)
+ def test_recovery_refuses_newer_or_mismatched_state(self):
+  self.ready();v=self.ds.load()['domain_versions']
+  with self.assertRaises(InterruptedError):self.ds.transaction('bad-recover',v,'priorities','A',{'production_priority':list('DCBA')},'prepared')
+  io=self.ds.io('production');r=io.read('state.json');r['state']['management']['production_priority']=list('BACD');io.write('state.json',r)
+  other=self.digest('monitoring');current=self.digest('production')
+  with self.assertRaises(ValueError):self.ds.recover('production')
+  self.assertEqual(other,self.digest('monitoring'));self.assertEqual(current,self.digest('production'))
+
+if __name__=='__main__':
+ result=unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(CrashTests(n) for n in CrashTests.__dict__ if n.startswith('test_')))
+ raise SystemExit(not result.wasSuccessful())
 
 @@ABC_END
 
